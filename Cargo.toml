@@ -1,0 +1,13 @@
+[package]
+name = "rust_nano"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = { version = "0.27", features = ["event-stream"] }
+tokio = { version = "1.35", features = ["full"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lsp-types = "0.94" # Официальные типы данных спецификации LSP
+
