@@ -1,2 +1,2 @@
 # boroda
-A minimalistic console text and code editor with LSP support
+A minimalistic console text and code editor with LSP support, vibecoded (mostly) on Rust
