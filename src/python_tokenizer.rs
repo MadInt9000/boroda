@@ -29,7 +29,7 @@ impl PythonTokenizer {
                     tokens.push(RenderToken {
                         start_col: col,
                         len: line.len() - col,
-                        token_type: 7, // 7 = Комментарий (Серый)
+                        token_type: 0, // 0 = Комментарий (Серый)
                     });
                     break; // Комментарий идет до конца строки
                 }
@@ -48,7 +48,7 @@ impl PythonTokenizer {
                     tokens.push(RenderToken {
                         start_col: start_str_col,
                         len: col - start_str_col,
-                        token_type: 6, // 6 = Строка (Желтый)
+                        token_type: 5, // 5 = Строка
                     });
                     continue;
                 }
@@ -59,7 +59,7 @@ impl PythonTokenizer {
                     tokens.push(RenderToken {
                         start_col: col,
                         len: 1,
-                        token_type: 6,
+                        token_type: 5,
                     });
                     col += 1;
                     continue;
@@ -76,11 +76,11 @@ impl PythonTokenizer {
                     }
 
                     let token_type = if py_keywords.contains(&word.as_str()) {
-                        0 // 0 = Ключевое слово (Бирюзовый)
+                        6 // 6 = Ключевое слово (Синий)
                     } else if word.chars().next().unwrap().is_uppercase() {
                         3 // 3 = Класс / Тип (Зеленый)
                     } else if col < line.len() && line[col] == '(' {
-                        5 // 5 = Метод / Функция (Синий)
+                        2 // 2 = Метод / Функция (Зеленый)
                     } else {
                         99 // Обычный текст, не красим
                     };

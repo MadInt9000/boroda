@@ -111,16 +111,16 @@ async fn main() -> io::Result<()> {
                         if let Some(result) = parse_result {
                             match result {
                                 LspParseResult::Tokens(ready_tokens) => {
-                                    editors[current_editor_idx].update_semantic_tokens(ready_tokens);
-                                    break;
+                                    editor.update_semantic_tokens(ready_tokens);
+                                    state_changed = true;
                                 }
                                 LspParseResult::Diagnostics { errors, warnings, diagnostics } => {
                                     editor.error_count = errors;
                                     editor.warning_count = warnings;
                                     editor.diagnostics = diagnostics;
+                                    state_changed = true;
                                 }
                             }
-                            state_changed = true;
                         }
                     }
 

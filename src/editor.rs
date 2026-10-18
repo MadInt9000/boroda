@@ -76,7 +76,7 @@ impl Editor {
 
     pub fn reload_file(&mut self) {
         let mut new_lines = Vec::new();
-        let abs_path = Path::new(&self.filename).canonicalize().unwrap_or_else(|_| Path::new(&self.filename).to_path_buf());
+        let abs_path = Path::new(&self.filename);
         
         if abs_path.exists() {
             if let Ok(file) = File::open(&abs_path) {
@@ -192,37 +192,48 @@ impl Editor {
 
     fn get_token_color(&self, token_type: u32) -> &'static str {
         match token_type {
-            0 | 1 => "\x1b[36m", // Ключевые слова -> Бирюзовый
+            1 | 10 => "\x1b[36m", // Ключевые слова -> Бирюзовый
             2 | 3 | 4 => "\x1b[32m", // Структуры, Типы -> Зеленый
-            5 => "\x1b[34m", // Функции -> Синий
-            6 => "\x1b[33m", // Строки -> Желтый
-            7 => "\x1b[90m", // Комментарии -> Серый
+            6 => "\x1b[34m", // Функции -> Синий
+            5 | 8 => "\x1b[33m", // Строки -> Желтый
+            7 | 9  => "\x1b[35m", // Хз -> Фиолетовый
+            0 => "\x1b[90m", // Комментарии -> Серый
             _ => "\x1b[0m",
         }
     }
 
-    // ИСПРАВЛЕНИЕ 2: Отрисовка строки берёт токены только из нужного индекса строки O(1)
     fn draw_line_with_lsp_syntax(&self, file_row: usize, render_len: usize) {
         let line = &self.lines[file_row];
-        // Достаем токены только для текущей строки
         let row_tokens = self.semantic_tokens.get(file_row);
-        
+    
+        // Индекс текущего проверяемого токена в строке
+        let mut token_idx = 0;
+
         for col_idx in 0..render_len {
             let file_col = col_idx + self.col_offset;
             if file_col >= line.len() { break; }
             let c = line[file_col];
 
+            // 1. Проверяем диагностику ошибок (она приоритетнее подсветки)
             let is_err = self.is_error_char(file_row, file_col);
-            
+        
             if is_err {
                 print!("\x1b[1;31m{}\x1b[0m", c);
             } else {
                 let mut color = "\x1b[0m";
+
                 if let Some(tokens) = row_tokens {
-                    for token in tokens {
+                    // Продвигаем указатель токенов вперед, если текущий символ 
+                    // уже находится правее текущего токена
+                    while token_idx < tokens.len() && file_col >= tokens[token_idx].start_col + tokens[token_idx].len {
+                        token_idx += 1;
+                    }
+
+                    // Если нашли токен, в границы которого попадает наш символ — берем его цвет
+                    if token_idx < tokens.len() {
+                        let token = &tokens[token_idx];
                         if file_col >= token.start_col && file_col < token.start_col + token.len {
                             color = self.get_token_color(token.token_type);
-                            break;
                         }
                     }
                 }
@@ -388,7 +399,7 @@ impl Editor {
             self.lines[self.cursor_y].clear();
         }
             self.cursor_x = 0;
-        }
+    }
 
     pub fn paste_line(&mut self) {
         if !self.clipboard.is_empty() {
@@ -454,6 +465,12 @@ impl Editor {
         self.lines[self.cursor_y].insert(self.cursor_x, c);
         self.cursor_x += 1;
     }
+    
+    pub fn delete_char_at_cursor(&mut self) {
+        if self.cursor_x < self.lines[self.cursor_y].len() {
+            self.lines[self.cursor_y].remove(self.cursor_x);
+        }
+    }
 
     pub fn delete_char(&mut self) {
         if self.cursor_x > 0 {
@@ -513,4 +530,87 @@ impl Editor {
             self.cursor_x += 1;
         }
     }
+
+    pub fn move_word_left(&mut self) {
+        let current_line_idx = self.cursor_y;
+        let line = &self.lines[current_line_idx];
+        let tokens = self.semantic_tokens.get(current_line_idx);
+
+        // Сценарий А: Если у нас есть семантические токены от LSP/Лексера
+        if let Some(toks) = tokens {
+            if !toks.is_empty() {
+                // Ищем ближайший токен, который начинается левее курсора
+                let mut target_x = 0;
+                for token in toks.iter().rev() {
+                    if token.start_col < self.cursor_x {
+                        target_x = token.start_col;
+                        break;
+                    }
+                }
+                // Если мы уже стояли в начале первого токена строки, прыгаем на конец предыдущей строки
+                if target_x == 0 && self.cursor_x == 0 && self.cursor_y > 0 {
+                    self.cursor_y -= 1;
+                    self.cursor_x = self.lines[self.cursor_y].len();
+                } else {
+                    self.cursor_x = target_x;
+                }
+                return;
+            }
+        }
+
+        // Сценарий Б: Фоллбэк (если токенов нет) — прыгаем по пробелам
+        if self.cursor_x > 0 {
+            let mut x = self.cursor_x - 1;
+            // Пропускаем пробелы слева
+            while x > 0 && (line[x] == ' ' || line[x] == '\t') { x -= 1; }
+            // Ищем начало слова
+            while x > 0 && line[x] != ' ' && line[x] != '\t' { x -= 1; }
+            if x > 0 || (line[x] == ' ' || line[x] == '\t') { self.cursor_x = x + 1; } 
+            else { self.cursor_x = 0; }
+        } else if self.cursor_y > 0 {
+            self.cursor_y -= 1;
+            self.cursor_x = self.lines[self.cursor_y].len();
+        }
+    }
+
+    pub fn move_word_right(&mut self) {
+        let current_line_idx = self.cursor_y;
+        let line = &self.lines[current_line_idx];
+        let tokens = self.semantic_tokens.get(current_line_idx);
+
+        // Сценарий А: Перемещение по LSP-токенам
+        if let Some(toks) = tokens {
+            if !toks.is_empty() {
+                let mut target_x = line.len();
+                for token in toks {
+                    if token.start_col > self.cursor_x {
+                        target_x = token.start_col;
+                        break;
+                    }
+                }
+                // Если правее токенов нет, переходим в начало следующей строки
+                if target_x == line.len() && self.cursor_x == line.len() && self.cursor_y < self.lines.len() - 1 {
+                    self.cursor_y += 1;
+                    self.cursor_x = 0;
+                } else {
+                    self.cursor_x = target_x;
+                }
+                return;
+            }
+        }
+
+        // Сценарий Б: Фоллбэк по пробелам
+        if self.cursor_x < line.len() {
+            let mut x = self.cursor_x;
+            // Пропускаем текущие не-пробелы
+            while x < line.len() && line[x] != ' ' && line[x] != '\t' { x += 1; }
+            // Пропускаем последующие пробелы
+            while x < line.len() && (line[x] == ' ' || line[x] == '\t') { x += 1; }
+            self.cursor_x = x;
+        } else if self.cursor_y < self.lines.len() - 1 {
+            self.cursor_y += 1;
+            self.cursor_x = 0;
+        }
+    }
+
 } 

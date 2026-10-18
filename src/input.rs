@@ -40,6 +40,15 @@ impl InputDriver {
                             }
                             return Ok(());
                         }
+                        // НОВЫЕ ГОРЯЧИЕ КЛАВИШИ:
+                        KeyCode::Left => {
+                            editor.move_word_left();
+                            return Ok(());
+                        }
+                        KeyCode::Right => {
+                            editor.move_word_right();
+                            return Ok(());
+                        }
                         _ => {}
                     }
                 }
@@ -89,7 +98,7 @@ impl InputDriver {
                     KeyCode::Down      => editor.move_down(),
                     KeyCode::Left      => editor.move_left(),
                     KeyCode::Right     => editor.move_right(),
-                    
+                    KeyCode::Delete    => editor.delete_char_at_cursor(),                    
                     // Табуляция (вставка 4-х пробелов)
                     KeyCode::Tab       => editor.insert_str("    "),
                     

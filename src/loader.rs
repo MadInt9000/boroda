@@ -23,18 +23,24 @@ impl ProjectLoader {
     }
 
     /// Метод для полной загрузки ОДИНОЧНОГО файла. 
-    /// Создает экземпляр Editor, при необходимости запускает LspClient и связывает их.
+    /// Теперь сам отвечает за приведение любого пути к абсолютному каноническому виду.
     pub fn load_single_file(
-        filename: String,
+        raw_filename: String, // Принимает любой сырой путь (относительный или абсолютный)
         lsp_pool: &mut HashMap<&'static str, LspClient>,
         global_tx: mpsc::UnboundedSender<Value>,
         current_dir: &str,
     ) -> Editor {
-        let mut editor = Editor::new(filename);
+        // КАНОНИЗАЦИЯ: Превращаем сырой путь в абсолютный на самом раннем этапе внутри метода
+        let path = Path::new(&raw_filename);
+        let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let abs_filename_str = abs_path.to_string_lossy().into_owned();
+
+        // Создаем Editor, строго используя абсолютный путь
+        let mut editor = Editor::new(abs_filename_str);
         
         if let Some(key) = Self::get_server_key(&editor.filename) {
-            // Создаем чистый адаптер метаданных
-            let mut adapter = LspAdapter::new(&editor.filename);
+            // Создаем адаптер метаданных и передаем ему каноничный путь
+            let adapter = LspAdapter::new(editor.filename.clone());
 
             // Ленивый запуск LspClient, если для этого языка сервер еще не поднят
             if !lsp_pool.contains_key(key) {
@@ -58,14 +64,6 @@ impl ProjectLoader {
                 lsp_pool.insert(key, client);
             }
 
-            //editor.lsp_adapter = Some(adapter);
-            // Извлекаем ссылку на клиент из пула для отправки первичных уведомлений
-//            if let Some(client) = lsp_pool.get(key) {
-//                let text_content = editor.get_all_text();
-//                adapter.did_open(client, &text_content);
-//                adapter.request_syntax_tokens(client, &editor.lines);
-//            }
-
             editor.lsp_adapter = Some(adapter);
         }
 
@@ -77,7 +75,7 @@ impl ProjectLoader {
     }
 
     /// Главный метод загрузки проекта. 
-    /// Сканирует окружение и делегирует создание каждого файла методу load_single_file.
+    /// Теперь просто собирает сырые имена файлов и безопасно делегирует их в load_single_file.
     pub fn load_project(
         global_tx: mpsc::UnboundedSender<Value>,
         current_dir: &str,
@@ -94,6 +92,7 @@ impl ProjectLoader {
                             let path = entry.path();
                             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                                 if matches!(ext, "py" | "rs" | "php") {
+                                    // Передаем как сырую строку, load_single_file сам разберется с путем
                                     filenames.push(path.to_string_lossy().into_owned());
                                 }
                             }

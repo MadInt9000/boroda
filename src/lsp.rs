@@ -138,14 +138,14 @@ impl LspClient {
         self.send_raw_message(json_str);
     }
 
-    pub fn request_semantic_tokens(&self, filename: &str) {
+    pub fn request_semantic_tokens_with_id(&self, filename: &str, request_id: i64) {
         let abs_path = std::fs::canonicalize(filename)
             .unwrap_or_else(|_| std::path::Path::new(filename).to_path_buf());
         let file_url = Url::from_file_path(&abs_path).unwrap();
 
         let msg = json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": request_id,
             "method": "textDocument/semanticTokens/full",
             "params": {
                 "textDocument": { "uri": file_url.to_string() }

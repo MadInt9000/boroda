@@ -10,9 +10,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+static GLOBAL_REQUEST_ID: AtomicI64 = AtomicI64::new(10);
+
 pub struct LspAdapter {
     pub version_counter: Arc<AtomicI64>,
     pub abs_filename_str: String,
+    // У каждого адаптера свое поле для отслеживания ID его последнего запроса
+    pub last_tokens_request_id: AtomicI64, 
 }
 
 // Чистый enum для передачи отпарсенных данных в главный цикл
@@ -26,16 +30,17 @@ pub enum LspParseResult {
 }
 
 impl LspAdapter {
-    /// Создает экземпляр адаптера и канонизирует его абсолютный путь
-    pub fn new(filename: &str) -> Self {
-        let abs_path = Path::new(filename)
-            .canonicalize()
-            .unwrap_or_else(|_| Path::new(filename).to_path_buf());
-        let abs_filename_str = abs_path.to_string_lossy().into_owned();
+    /// Вспомогательный приватный метод для инкремента сквозного ID
+    fn next_global_id() -> i64 {
+        GLOBAL_REQUEST_ID.fetch_add(1, Ordering::SeqCst)
+    }
 
+    /// Создает экземпляр адаптера и канонизирует его абсолютный путь
+    pub fn new(abs_filename_str: String) -> Self {
         Self {
             version_counter: Arc::new(AtomicI64::new(1)),
             abs_filename_str,
+            last_tokens_request_id: AtomicI64::new(0),
         }
     }
 
@@ -91,7 +96,7 @@ impl LspAdapter {
     }
 
     /// Запрашивает токены. Если это Python — мгновенно возвращает локально распарсенную матрицу токенов.
-    /// Если это другой язык — отправляет асинхронный запрос на сервер и возвращает None.
+    /// Если это другой язык — генерирует сквозной ID запроса, запоминает его и запрашивает асинхронно у LSP.
     pub fn request_syntax_tokens(&self, client: &LspClient, lines: &[Vec<char>]) -> Option<LspParseResult> {
         let ext = Path::new(&self.abs_filename_str)
             .extension()
@@ -103,8 +108,14 @@ impl LspAdapter {
             let local_tokens = PythonTokenizer::tokenize_file(lines);
             Some(LspParseResult::Tokens(local_tokens))
         } else {
-            // Для остальных языков запрашиваем асинхронно у внешнего LSP
-            client.request_semantic_tokens(&self.abs_filename_str);
+            // Генерируем уникальный сквозной ID из статического свойства структуры
+            let next_id = Self::next_global_id();
+            
+            // Запоминаем его локально в этом файле
+            self.last_tokens_request_id.store(next_id, Ordering::SeqCst);
+            
+            // Передаем этот ID серверу
+            client.request_semantic_tokens_with_id(&self.abs_filename_str, next_id);
             None
         }
     }
@@ -132,15 +143,10 @@ impl LspAdapter {
         &self, 
         lsp_pool: &HashMap<&'static str, LspClient>, 
         lsp_msg: &Value, 
-        text_content: &str, // Передаем текст по ссылке
-        total_lines: usize   // Передаем размер
+        text_content: &str, 
+        total_lines: usize   
     ) -> Option<LspParseResult> {
         
-        //if let Ok(mut log_file) = std::fs::OpenOptions::new().create(true).append(true).open("lsp_debug.log") {
-        //    use std::io::Write;
-        //    let _ = writeln!(log_file, "SERVER: {}", lsp_msg);
-       // }
-
         // 1. Проверяем ответы по ID запроса
         if let Some(id) = lsp_msg.get("id").and_then(|id| id.as_i64()) {
             
@@ -154,15 +160,20 @@ impl LspAdapter {
                         // Официально открываем документ на сервере, используя переданный текст
                         self.did_open(client, text_content);
                         
-                        // Запрашиваем токены подсветки синтаксиса
-                        client.request_semantic_tokens(&self.abs_filename_str);
+                        // Генерируем сквозной ID для первичного запроса токенов
+                        let next_id = Self::next_global_id();
+                        self.last_tokens_request_id.store(next_id, Ordering::SeqCst);
+                        
+                        client.request_semantic_tokens_with_id(&self.abs_filename_str, next_id);
                     }
                 }
                 return None;
             }
 
-            // id == 2: Обработка пришедших семантических токенов
-            if id == 2 {
+            // Обработка пришедших семантических токенов
+            // Проверяем, совпадает ли пришедший ID с последним отправленным для ЭТОГО файла
+            let expected_id = self.last_tokens_request_id.load(Ordering::SeqCst);
+            if id == expected_id {
                 if let Some(result) = lsp_msg.get("result") {
                     if let Some(data) = result.get("data").and_then(|d| d.as_array()) {
                         let mut new_tokens = vec![Vec::new(); total_lines];
@@ -177,9 +188,12 @@ impl LspAdapter {
 
                             if delta_line > 0 {
                                 current_line += delta_line;
-                                current_char = 0;
+                                // На новой строке delta_start — это абсолютное смещение от начала
+                                current_char = delta_start; 
+                            } else {
+                                // На той же строке delta_start — смещение относительно предыдущего токена
+                                current_char += delta_start;
                             }
-                            current_char += delta_start;
 
                             if current_line < new_tokens.len() {
                                 new_tokens[current_line].push(RenderToken {
@@ -231,7 +245,6 @@ impl LspAdapter {
                 return Some(LspParseResult::Diagnostics { errors, warnings, diagnostics });
             }
         }
-
         None
     }
 }
