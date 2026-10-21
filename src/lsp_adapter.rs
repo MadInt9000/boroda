@@ -3,7 +3,7 @@ use crate::editor::LspDiagnostic;
 use crate::lsp::LspClient;
 use crate::tokens::RenderToken;
 use crate::python_tokenizer::PythonTokenizer;
-
+use crate::loader::ProjectLoader;
 use lsp_types::Url;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -152,7 +152,7 @@ impl LspAdapter {
             
             // id == 1: Фоновый хендшейк инициализации
             if id == 1 {
-                if let Some(key) = crate::loader::ProjectLoader::get_server_key(&self.abs_filename_str) {
+                if let Some(key) = ProjectLoader::get_server_key(&self.abs_filename_str) {
                     if let Some(client) = lsp_pool.get(key) {
                         // Завершаем хендшейк
                         client.send_initialized();

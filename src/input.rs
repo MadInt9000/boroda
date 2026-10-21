@@ -25,19 +25,11 @@ impl InputDriver {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::PageUp => {
-                            if *current_idx > 0 {
-                                *current_idx -= 1;
-                            } else {
-                                *current_idx = editors.len() - 1; // Циклический переход в конец
-                            }
+                            InputDriver::previous_editor(editors, current_idx);
                             return Ok(());
                         }
                         KeyCode::PageDown => {
-                            if *current_idx < editors.len() - 1 {
-                                *current_idx += 1;
-                            } else {
-                                *current_idx = 0; // Циклический переход в начало
-                            }
+                            InputDriver::next_editor(editors, current_idx);
                             return Ok(());
                         }
                         // НОВЫЕ ГОРЯЧИЕ КЛАВИШИ:
@@ -116,6 +108,16 @@ impl InputDriver {
                     MouseEventKind::Down(MouseButton::Left) => {
                         editor.click_mouse(mouse_event.column, mouse_event.row);
                     }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if mouse_event.row == 0 {
+                            InputDriver::previous_editor(editors, current_idx);
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Right) => {
+                        if mouse_event.row == 0 {
+                            InputDriver::next_editor(editors, current_idx);
+                        }
+                    }
                     MouseEventKind::ScrollUp => {
                         editor.move_up();
                     }
@@ -128,5 +130,21 @@ impl InputDriver {
             _ => {}
         }
         Ok(())
+    }
+    
+    fn next_editor(editors:&mut Vec<Editor>, current_idx:&mut usize) {
+        if *current_idx < editors.len() - 1 {
+            *current_idx += 1;
+        } else {
+            *current_idx = 0;
+        }
+    }
+    
+    fn previous_editor(editors:&mut Vec<Editor>, current_idx:&mut usize) {
+        if *current_idx > 0 {
+            *current_idx -= 1;
+        } else {
+            *current_idx = editors.len() - 1
+        }
     }
 }
