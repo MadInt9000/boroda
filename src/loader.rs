@@ -1,8 +1,6 @@
 use crate::editor::Editor;
 use crate::lsp::LspClient;
 use crate::lsp_adapter::LspAdapter;
-
-use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use tokio::sync::mpsc;
@@ -11,79 +9,70 @@ use serde_json::Value;
 pub struct ProjectLoader;
 
 impl ProjectLoader {
-    /// Вспомогательный метод для определения ключа сервера по расширению
-    pub fn get_server_key(filename: &str) -> Option<&'static str> {
+    pub fn get_server_index(filename: &str) -> Option<usize> {
         let ext = Path::new(filename).extension().and_then(|s| s.to_str()).unwrap_or("");
         match ext {
-            "py" => Some("py"),
-            "rs" => Some("rs"),
-            "php" => Some("php"),
+            "py" => Some(0),
+            "rs" => Some(1),
+            "php" => Some(2),
             _ => None,
         }
     }
 
-    /// Метод для полной загрузки ОДИНОЧНОГО файла. 
-    /// Теперь сам отвечает за приведение любого пути к абсолютному каноническому виду.
+    pub fn create_empty_pool() -> Vec<LspClient> {
+        vec![
+            LspClient::new_stub("pyright-langserver"), 
+            LspClient::new_stub("rust-analyzer"),      
+            LspClient::new_stub("intelephense"),       
+        ]
+    }
+
+    // Метод снова СИНХРОННЫЙ
     pub fn load_single_file(
-        raw_filename: String, // Принимает любой сырой путь (относительный или абсолютный)
-        lsp_pool: &mut HashMap<&'static str, LspClient>,
+        raw_filename: String,
+        lsp_pool: &[LspClient], // Передаем как обычный срез пула
         global_tx: mpsc::UnboundedSender<Value>,
         current_dir: &str,
     ) -> Editor {
-        // КАНОНИЗАЦИЯ: Превращаем сырой путь в абсолютный на самом раннем этапе внутри метода
         let path = Path::new(&raw_filename);
-        let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        //let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            // 2. ФОЛЛБЭК: Если файла нет на диске, проверяем, абсолютный ли он изначально
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                // 3. Если путь относительный, вручную склеиваем его с текущей рабочей директорией
+                let mut base = std::env::current_dir().unwrap_or_else(|_| Path::new(current_dir).to_path_buf());
+                base.push(path);
+                base
+            }
+        });
         let abs_filename_str = abs_path.to_string_lossy().into_owned();
 
-        // Создаем Editor, строго используя абсолютный путь
         let mut editor = Editor::new(abs_filename_str);
         
-        if let Some(key) = Self::get_server_key(&editor.filename) {
-            // Создаем адаптер метаданных и передаем ему каноничный путь
+        if let Some(idx) = Self::get_server_index(&editor.filename) {
             let adapter = LspAdapter::new(editor.filename.clone());
 
-            // Ленивый запуск LspClient, если для этого языка сервер еще не поднят
-            if !lsp_pool.contains_key(key) {
-                let cmd = match key {
-                    "py" => "pyright-langserver",
-                    "rs" => "rust-analyzer",
-                    "php" => "intelephense",
-                    _ => "",
-                };
-                
-                let (client, mut rx) = LspClient::start(cmd, current_dir);
-                let tx = global_tx.clone();
-                
-                // Перенаправляем сообщения сервера в единый глобальный канал
-                tokio::spawn(async move {
-                    while let Some(msg) = rx.recv().await {
-                        let _ = tx.send(msg);
-                    }
-                });
-                client.send_initialize(current_dir);                
-                lsp_pool.insert(key, client);
-            }
+            // СИНХРОННЫЙ СТАРТ: метод сам проверит флаг is_started внутри мьютекса
+            lsp_pool[idx].start(current_dir, global_tx);
 
             editor.lsp_adapter = Some(adapter);
         }
 
-        // Обновляем геометрию окна под терминал и скроллим
         let _ = editor.update_window_size();
         editor.scroll();
-        
         editor
     }
 
-    /// Главный метод загрузки проекта. 
-    /// Теперь просто собирает сырые имена файлов и безопасно делегирует их в load_single_file.
+    // Метод снова СИНХРОННЫЙ
     pub fn load_project(
         global_tx: mpsc::UnboundedSender<Value>,
         current_dir: &str,
-    ) -> (Vec<Editor>, HashMap<&'static str, LspClient>) {
-        let mut lsp_pool: HashMap<&'static str, LspClient> = HashMap::new();
+    ) -> (Vec<Editor>, Vec<LspClient>) {
+        let lsp_pool = Self::create_empty_pool();
         let mut filenames: Vec<String> = env::args().skip(1).collect();
 
-        // Сканируем папку при отсутствии аргументов командной строки
         if filenames.is_empty() {
             if let Ok(entries) = std::fs::read_dir(".") {
                 for entry in entries.flatten() {
@@ -92,7 +81,6 @@ impl ProjectLoader {
                             let path = entry.path();
                             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                                 if matches!(ext, "py" | "rs" | "php") {
-                                    // Передаем как сырую строку, load_single_file сам разберется с путем
                                     filenames.push(path.to_string_lossy().into_owned());
                                 }
                             }
@@ -102,17 +90,16 @@ impl ProjectLoader {
             }
         }
 
-        // Фоллбэк для пустого проекта
         if filenames.is_empty() {
             filenames.push("untitled.txt".to_string());
         }
 
-        // Вызываем метод загрузки единичного файла для каждого элемента в цикле
         let mut editors = Vec::new();
         for filename in filenames {
+            // Синхронный вызов без всяких .await
             let editor = Self::load_single_file(
                 filename, 
-                &mut lsp_pool, 
+                &lsp_pool, 
                 global_tx.clone(), 
                 current_dir
             );
@@ -122,3 +109,4 @@ impl ProjectLoader {
         (editors, lsp_pool)
     }
 }
+

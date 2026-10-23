@@ -1,19 +1,54 @@
 use lsp_types::Url;
 use serde_json::{json, Value};
 use std::process::Stdio;
+use std::sync::Mutex; // Используем СИНХРОННЫЙ мьютекс для внутренней мутабельности
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 pub struct LspClient {
-    _process: Child,
-    tx: mpsc::UnboundedSender<String>,
+    pub server_command: &'static str,
+    // Внутреннее состояние скрыто под синхронным Mutex
+    inner: Mutex<LspClientState>,
+}
+
+struct LspClientState {
+    is_started: bool,
+    tx: Option<mpsc::UnboundedSender<String>>,
+    _process: Option<Child>,
 }
 
 impl LspClient {
-    pub fn start(server_command: &str, current_dir: &str) -> (Self, mpsc::UnboundedReceiver<Value>) {
-        let mut cmd = Command::new(server_command);
-        if server_command.contains("pyright") || server_command.contains("intelephense") {
+    /// Создает преднастроенный клиент в состоянии "не запущен"
+    pub fn new_stub(server_command: &'static str) -> Self {
+        Self {
+            server_command,
+            inner: Mutex::new(LspClientState {
+                is_started: false,
+                tx: None,
+                _process: None,
+            }),
+        }
+    }
+
+    /// Публичный метод для проверки флага запущенности
+    pub fn is_started(&self) -> bool {
+        self.inner.lock().unwrap().is_started
+    }
+
+    /// Полностью СИНХРОННЫЙ метод старта. Просто проверяет флаг и запускает процесс.
+    pub fn start(&self, current_dir: &str, global_tx: mpsc::UnboundedSender<Value>) {
+        let mut state = self.inner.lock().unwrap();
+        
+        // 1. Проверяем флаг — если уже запущен, ничего не делаем
+        if state.is_started {
+            return;
+        }
+
+        // 2. Синхронно настраиваем и запускаем процесс через Command::spawn
+        let mut cmd = Command::new(self.server_command);
+        if self.server_command.contains("pyright") || self.server_command.contains("intelephense") {
             cmd.arg("--stdio");
         }
 
@@ -29,9 +64,9 @@ impl LspClient {
         let stdout = child.stdout.take().expect("Failed to open stdout");
 
         let (tx_in, mut rx_in) = mpsc::unbounded_channel::<String>();
-        let (tx_out, rx_out) = mpsc::unbounded_channel::<Value>();
+        let (tx_out, mut rx_out) = mpsc::unbounded_channel::<Value>();
 
-        // 1. Поток записи на сервер
+        // 3. Поток записи на сервер (асинхронный фон)
         tokio::spawn(async move {
             while let Some(msg) = rx_in.recv().await {
                 let full_msg = format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
@@ -42,7 +77,15 @@ impl LspClient {
             }
         });
 
-        // 2. Поток чтения ответов от сервера
+        // 4. Перенаправление ответов в единый глобальный канал приложения
+        let tx_global = global_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx_out.recv().await {
+                let _ = tx_global.send(msg);
+            }
+        });
+
+        // 5. Поток чтения ответов от сервера (асинхронный фон)
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -54,12 +97,10 @@ impl LspClient {
                     if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
                         return;
                     }
-
                     let trimmed = line.trim_matches(|c| c == '\r' || c == '\n');
                     if trimmed.is_empty() {
                         break;
                     }
-
                     if trimmed.starts_with("Content-Length:") {
                         if let Some(len_str) = trimmed.split(':').nth(1) {
                             content_length = len_str.trim().parse::<usize>().unwrap_or(0);
@@ -67,9 +108,7 @@ impl LspClient {
                     }
                 }
 
-                if content_length == 0 {
-                    return;
-                }
+                if content_length == 0 { return; }
 
                 let mut buf = vec![0u8; content_length];
                 if reader.read_exact(&mut buf).await.is_ok() {
@@ -84,15 +123,25 @@ impl LspClient {
             }
         });
 
-        (Self { _process: child, tx: tx_in }, rx_out)
+        // Запоминаем канал отправки и дочерний процесс
+        state.tx = Some(tx_in);
+        state._process = Some(child);
+        state.is_started = true;
+
+        // Инициируем фоновое фоновое приветствие (отправку initialize осуществляем сразу)
+        // Так как send_initialize теперь синхронный, вызываем его прямо здесь
+        drop(state); // Освобождаем lock перед отправкой сообщений самой себе
+        self.send_initialize(current_dir);
     }
 
     pub fn send_raw_message(&self, json_str: String) {
-        let _ = self.tx.send(json_str);
+        if let Some(ref tx) = self.inner.lock().unwrap().tx {
+            let _ = tx.send(json_str);
+        }
     }
 
     pub fn send_initialize(&self, current_dir: &str) {
-        let path = std::path::Path::new(current_dir);
+        let path = Path::new(current_dir);
         let root_url = Url::from_directory_path(path).unwrap();
         
         let msg = json!({
@@ -103,16 +152,11 @@ impl LspClient {
                 "processId": std::process::id(),
                 "rootUri": root_url.to_string(),
                 "rootPath": current_dir,
-                "workspaceFolders": [
-                    {
-                        "uri": root_url.to_string(),
-                        "name": "root"
-                    }
-                ],
+                "workspaceFolders": [{"uri": root_url.to_string(), "name": "root"}],
                 "capabilities": {
                     "textDocument": {
                         "synchronization": {
-                            "change": 1, // Full Sync
+                            "change": 1,
                             "dynamicRegistration": true,
                             "willSave": false,
                             "willSaveWaitUntil": false,
@@ -133,14 +177,12 @@ impl LspClient {
             "method": "initialized",
             "params": {}
         });
-
         let json_str = serde_json::to_string(&msg).unwrap();
         self.send_raw_message(json_str);
     }
 
     pub fn request_semantic_tokens_with_id(&self, filename: &str, request_id: i64) {
-        let abs_path = std::fs::canonicalize(filename)
-            .unwrap_or_else(|_| std::path::Path::new(filename).to_path_buf());
+        let abs_path = std::fs::canonicalize(filename).unwrap_or_else(|_| Path::new(filename).to_path_buf());
         let file_url = Url::from_file_path(&abs_path).unwrap();
 
         let msg = json!({

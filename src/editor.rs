@@ -1,6 +1,7 @@
 // Добавьте в начало src/editor.rs
 use crate::lsp_adapter::LspAdapter;
 use crate::tokens::RenderToken; // Подключаем единую структуру
+use crate::clipboard::ClipboardManager;
 use crossterm::{
     cursor,
     event::{Event, KeyCode},
@@ -10,6 +11,12 @@ use crossterm::{
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Selection {
+    pub start_x: usize,
+    pub start_y: usize,
+}
 
 pub struct LspDiagnostic {
     pub start_line: usize,
@@ -30,7 +37,7 @@ pub struct Editor {
     pub screen_rows: u16,
     pub has_indent: bool,
     pub should_quit: bool,
-    pub clipboard: Vec<char>,
+    pub selection: Option<Selection>,
     pub error_count: usize,
     pub warning_count: usize,
     pub diagnostics: Vec<LspDiagnostic>,
@@ -53,7 +60,7 @@ impl Editor {
             screen_rows: 0,
             has_indent: true,
             should_quit: false,
-            clipboard: Vec::new(),
+            selection: None,
             error_count: 0,
             warning_count: 0,
             diagnostics: Vec::new(),
@@ -95,7 +102,7 @@ impl Editor {
         
         // Синхронизируем размер индекса токенов с количеством строк
         self.semantic_tokens = vec![Vec::new(); self.lines.len()];
-        
+        self.selection = None;        
         self.cursor_x = 0;
         self.cursor_y = 0;
         self.row_offset = 0;
@@ -190,6 +197,35 @@ impl Editor {
         false
     }
 
+    pub fn is_inside_selection(&self, row: usize, col: usize) -> bool {
+        if let Some(sel) = self.selection {
+            // Определяем точные границы (нормализуем start и end, так как выделять можно снизу вверх и справа налево)
+            let (p1_y, p1_x) = (sel.start_y, sel.start_x);
+            let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
+        
+            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+                (p1_y, p1_x, p2_y, p2_x)
+            } else {
+                (p2_y, p2_x, p1_y, p1_x)
+            };
+
+            if row < start_y || row > end_y {
+                return false;
+            }
+            if row == start_y && row == end_y {
+                return col >= start_x && col < end_x;
+            }
+            if row == start_y {
+                return col >= start_x;
+            }
+            if row == end_y {
+                return col < end_x;
+            }
+            return true; // Строка целиком внутри выделения
+        }
+        false
+    }
+
     fn get_token_color(&self, token_type: u32) -> &'static str {
         match token_type {
             1 | 10 => "\x1b[36m", // Ключевые слова -> Бирюзовый
@@ -201,8 +237,46 @@ impl Editor {
             _ => "\x1b[0m",
         }
     }
-
     fn draw_line_with_lsp_syntax(&self, file_row: usize, render_len: usize) {
+        let line = &self.lines[file_row];
+        let row_tokens = self.semantic_tokens.get(file_row);
+        let mut token_idx = 0;
+
+        for col_idx in 0..render_len {
+            let file_col = col_idx + self.col_offset;
+            if file_col >= line.len() { break; }
+            let c = line[file_col];
+
+            let is_err = self.is_error_char(file_row, file_col);
+            let is_sel = self.is_inside_selection(file_row, file_col); // Проверяем выделение
+
+            if is_sel {
+                print!("\x1b[7m{}\x1b[m", c);
+                continue;                
+            }
+            
+            if is_err {
+                print!("\x1b[1;31m{}\x1b[0m", c);
+            } else {
+                let mut color = "\x1b[0m";
+                if let Some(tokens) = row_tokens {
+                    while token_idx < tokens.len() && file_col >= tokens[token_idx].start_col + tokens[token_idx].len {
+                        token_idx += 1;
+                    }
+                    if token_idx < tokens.len() {
+                        let token = &tokens[token_idx];
+                        if file_col >= token.start_col && file_col < token.start_col + token.len {
+                            color = self.get_token_color(token.token_type);
+                        }
+                    }
+                }
+            
+                print!("{}{}\x1b[0m", color, c);
+            }
+        }
+    }
+
+    fn draw_line_with_lsp_syntax_old(&self, file_row: usize, render_len: usize) {
         let line = &self.lines[file_row];
         let row_tokens = self.semantic_tokens.get(file_row);
     
@@ -324,7 +398,7 @@ impl Editor {
         }
 
         let footer_text = active_error_msg.unwrap_or_else(|| {
-            "F1 TogIdt|F2 Save|F3 Search|F4 New|F5 Clear|F6 Info|F7 Cut|F8 Paste|F9 Begin|F10 Quit|F11 ExSave|F12 Reload".to_string()
+            "F1 TogIdt|F2 Save|F3 Search|F4 GoDef|F5 Copy|F6 Clear|F7 Cut|F8 Paste|F9 Begin|F10 Quit|F11 ExSave|F12 Reload".to_string()
         });
 
         let render_hints = if footer_text.len() > self.screen_cols as usize {
@@ -382,29 +456,6 @@ impl Editor {
         if !self.lines.is_empty() {
             self.lines[self.cursor_y].clear();
             self.semantic_tokens[self.cursor_y].clear(); // Очищаем токены строки
-            self.cursor_x = 0;
-        }
-    }
-
-    pub fn cut_line(&mut self) {
-        if self.lines.len() > 1 {
-            self.clipboard = self.lines.remove(self.cursor_y);
-            self.semantic_tokens.remove(self.cursor_y); // Удаляем строку из индекса подсветки
-            if self.cursor_y >= self.lines.len() {
-                self.cursor_y = self.lines.len() - 1;
-            }
-        } else {
-            self.clipboard = self.lines[self.cursor_y].clone();
-            self.semantic_tokens[self.cursor_y].clear();
-            self.lines[self.cursor_y].clear();
-        }
-            self.cursor_x = 0;
-    }
-
-    pub fn paste_line(&mut self) {
-        if !self.clipboard.is_empty() {
-            self.lines.insert(self.cursor_y, self.clipboard.clone());
-            self.semantic_tokens.insert(self.cursor_y, Vec::new()); // Вставляем пустой слот для
             self.cursor_x = 0;
         }
     }
@@ -610,6 +661,172 @@ impl Editor {
         } else if self.cursor_y < self.lines.len() - 1 {
             self.cursor_y += 1;
             self.cursor_x = 0;
+        }
+    }
+
+    /// Возвращает выделенный текст в виде String, либо пустую строку
+    pub fn get_selected_text(&self) -> String {
+        if let Some(sel) = self.selection {
+            let (p1_y, p1_x) = (sel.start_y, sel.start_x);
+            let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
+            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+                (p1_y, p1_x, p2_y, p2_x)
+            } else {
+                (p2_y, p2_x, p1_y, p1_x)
+            };
+
+            let mut result = String::new();
+            for y in start_y..=end_y {
+                if y >= self.lines.len() { break; }
+                let line = &self.lines[y];
+                let s_x = if y == start_y { start_x.min(line.len()) } else { 0 };
+                let e_x = if y == end_y { end_x.min(line.len()) } else { line.len() };
+            
+                let segment: String = line[s_x..e_x].iter().collect();
+                result.push_str(&segment);
+                if y < end_y {
+                    result.push('\n');
+                }
+            }
+            result
+        } else {
+            String::new()
+        }
+    }
+
+    /// Удаляет выделенный текст, если он есть
+    pub fn delete_selection(&mut self) {
+        if let Some(sel) = self.selection {
+            let (p1_y, p1_x) = (sel.start_y, sel.start_x);
+            let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
+            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+                (p1_y, p1_x, p2_y, p2_x)
+            } else {
+                (p2_y, p2_x, p1_y, p1_x)
+            };
+
+            if start_y == end_y {
+                if start_y < self.lines.len() {
+                    self.lines[start_y].drain(start_x..end_x);
+                    self.semantic_tokens[start_y].clear(); // Сбрасываем кэш токенов измененной строки
+                }
+            } else {
+                // Сложное многострочное удаление
+                let mut remaining_suffix = Vec::new();
+                if end_y < self.lines.len() {
+                    remaining_suffix = self.lines[end_y][end_x..].to_vec();
+                }
+            
+                // Удаляем промежуточные и конечную строки
+                if start_y + 1 < self.lines.len() {
+                    let drain_end = (end_y + 1).min(self.lines.len());
+                    self.lines.drain((start_y + 1)..drain_end);
+                    self.semantic_tokens.drain((start_y + 1)..drain_end);
+                }
+            
+                // Обрезаем стартовую строку и приклеиваем остаток хвоста конечной строки
+                if start_y < self.lines.len() {
+                    self.lines[start_y].truncate(start_x);
+                    self.lines[start_y].extend(remaining_suffix);
+                    self.semantic_tokens[start_y].clear();
+                }
+            }
+
+            // Переводим курсор в начало бывшего выделения и сбрасываем его
+            self.cursor_y = start_y;
+            self.cursor_x = start_x;
+            self.selection = None;
+        }
+    }
+
+    /// Копирование выделенного фрагмента (или текущей строки, если выделения нет) в ClipboardManager
+    pub fn copy_to_clipboard(&self) {
+        let text_to_copy = if self.selection.is_some() {
+            self.get_selected_text()
+        } else {
+            // Если ничего не выделено — копируем текущую строку целиком (поведение F7)
+            let mut line_str: String = self.lines[self.cursor_y].iter().collect();
+            line_str.push('\n');
+            line_str
+        };
+    
+        if !text_to_copy.is_empty() {
+            ClipboardManager::global().set_text(text_to_copy);
+        }
+    }
+
+    /// Вырезание (копирование + удаление)
+    pub fn cut_to_clipboard(&mut self) {
+        if self.selection.is_some() {
+            self.copy_to_clipboard();
+            self.delete_selection();
+        } else {
+            // Поведение по умолчанию для F7 (вырезать всю строку)
+            self.copy_to_clipboard();
+            if self.lines.len() > 1 {
+                self.lines.remove(self.cursor_y);
+                self.semantic_tokens.remove(self.cursor_y);
+                if self.cursor_y >= self.lines.len() {
+                    self.cursor_y = self.lines.len() - 1;
+                }
+            } else {
+                self.lines[self.cursor_y].clear();
+                self.semantic_tokens[self.cursor_y].clear();
+            }
+            self.cursor_x = 0;
+        }
+    }
+
+    /// Вставка текста из ClipboardManager в позицию курсора
+    pub fn paste_from_clipboard(&mut self) {
+        // Если перед вставкой что-то выделено — заменяем выделение
+        if self.selection.is_some() {
+            self.delete_selection();
+        }
+
+        let text = ClipboardManager::global().get_text();
+        if text.is_empty() { return; }
+
+        // Разделяем вставляемый текст на строки
+        let insert_lines: Vec<&str> = text.split('\n').collect();
+
+        if insert_lines.len() == 1 {
+            // Простая однострочная вставка
+            let chars: Vec<char> = insert_lines[0].chars().collect();
+            let len = chars.len();
+            self.lines[self.cursor_y].splice(self.cursor_x..self.cursor_x, chars);
+            self.semantic_tokens[self.cursor_y].clear();
+            self.cursor_x += len;
+        } else {
+            // Многострочная вставка
+            let current_line = &mut self.lines[self.cursor_y];
+            let tail: Vec<char> = current_line.split_off(self.cursor_x);
+        
+            // Вставляем первую часть в текущую строку
+            current_line.extend(insert_lines[0].chars());
+            self.semantic_tokens[self.cursor_y].clear();
+
+            let mut insert_idx = self.cursor_y + 1;
+        
+            // Вставляем средние строки
+            for &middle_line in &insert_lines[1..insert_lines.len() - 1] {
+                let chars: Vec<char> = middle_line.chars().collect();
+                self.lines.insert(insert_idx, chars);
+                self.semantic_tokens.insert(insert_idx, Vec::new());
+                insert_idx += 1;
+            }
+
+            // Вставляем последнюю строку и приклеиваем к ней сохраненный tail
+            let mut last_inserted_line: Vec<char> = insert_lines.last().unwrap().chars().collect();
+            let last_line_len = last_inserted_line.len();
+            last_inserted_line.extend(tail);
+        
+            self.lines.insert(insert_idx, last_inserted_line);
+            self.semantic_tokens.insert(insert_idx, Vec::new());
+
+            // Перемещаем курсор на конец вставленного блока
+            self.cursor_y = insert_idx;
+            self.cursor_x = last_line_len;
         }
     }
 
