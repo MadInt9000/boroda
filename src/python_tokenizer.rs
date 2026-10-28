@@ -1,152 +1,130 @@
 use crate::tokens::RenderToken;
+use regex::Regex;
 
 pub struct PythonTokenizer;
 
 impl PythonTokenizer {
-    /// Построчный лексер Python с поддержкой многострочных блоков и подсветки чисел
-    pub fn tokenize_file(lines: &[Vec<char>]) -> Vec<Vec<RenderToken>> {
+    /// Построчный лексер Python на регулярных выражениях с использованием замыкания
+    pub fn tokenize_text(lines: &[Vec<char>]) -> Vec<Vec<RenderToken>> {
         let mut file_tokens = vec![Vec::new(); lines.len()];
 
-        let py_keywords = [
-            "def", "class", "return", "if", "elif", "else", "import", "from", "as", 
-            "for", "in", "while", "try", "except", "finally", "with", "assert", 
-            "pass", "break", "continue", "lambda", "None", "True", "False", 
-            "and", "or", "not", "is", "global", "nonlocal"
-        ];
+        // 1. Компилируем регулярные выражения
+        let comment_regex = Regex::new(r"#.*").unwrap();
+        let string_double = Regex::new(r#""[^"\\]*(?:\\.[^"\\]*)*""#).unwrap();
+        let string_single = Regex::new(r#"'[^'\\]*(?:\\.[^'\\]*)*'"#).unwrap();
+        
+        let keywords_regex = Regex::new(
+            r"\b(def|class|return|if|elif|else|import|from|as|for|in|while|try|except|finally|with|assert|pass|break|continue|lambda|None|True|False|and|or|not|is|global|nonlocal)\b"
+        ).unwrap();
+
+        let class_name_regex = Regex::new(r"\b[A-Z][a-zA-Z0-9_]*\b").unwrap();
+        let function_call_regex = Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(").unwrap();
+        let number_regex = Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap();
 
         let mut in_multiline = false;
 
         for (row_idx, line) in lines.iter().enumerate() {
-            let mut col = 0;
             let mut tokens = Vec::new();
-
-            // Переводим вектор char в String для быстрой проверки наличия тегов
             let line_str: String = line.iter().collect();
 
-            // 1. Проверяем наличие тройных кавычек в строке. Если они есть — инвертируем флаг.
-            if line_str.contains("\"\"\"") || line_str.contains("'''") {
-                in_multiline = !in_multiline;
-                
-                // Красим текущую строку (где блок открылся или закрылся) целиком
+            // 2. Обработка многострочных блоков (Docstrings: """ или ''')
+            let doc_count = line_str.matches("\"\"\"").count() + line_str.matches("'''").count();
+            if doc_count > 0 {
                 tokens.push(RenderToken {
                     start_col: 0,
                     len: line.len(),
-                    token_type: 5, // 5 = Цвет строки/Docstring (Желтый)
+                    token_type: 14,
                 });
                 file_tokens[row_idx] = tokens;
-                continue; // Переходим к следующей строке файла
+                if doc_count == 1 { 
+                    in_multiline = !in_multiline; 
+                }
+                continue;
             }
 
-            // 2. Если флаг установлен (мы внутри тела многострочного блока) — просто красим и скипаем
             if in_multiline {
                 tokens.push(RenderToken {
                     start_col: 0,
                     len: line.len(),
-                    token_type: 5,
+                    token_type: 14,
                 });
                 file_tokens[row_idx] = tokens;
                 continue;
             }
 
-            // 3. Стандартный посимвольный разбор обычного Python-кода
-            let mut in_string = false;
-            let mut string_char = '"';
+            // 3. Маска стилей для текущей строки (99 = обычный текст)
+            let mut style_mask = vec![99u32; line.len()];
 
-            while col < line.len() {
-                let c = line[col];
-
-                // Обработка обычных однострочных строк
-                if in_string {
-                    let start_str_col = col;
-                    while col < line.len() {
-                        if line[col] == string_char {
-                            col += 1;
-                            in_string = false;
-                            break;
-                        }
-                        col += 1;
+            // Универсальное замыкание для заполнения маски
+            let mut fill_mask = |start_byte: usize, end_byte: usize, token_type: u32| {
+                let start_char = line_str[..start_byte].chars().count();
+                let end_char = line_str[..end_byte].chars().count();
+                for i in start_char..end_char {
+                    if i < style_mask.len() {
+                        style_mask[i] = token_type;
                     }
-                    tokens.push(RenderToken {
-                        start_col: start_str_col,
-                        len: col - start_str_col,
-                        token_type: 5,
-                    });
-                    continue;
                 }
+            };
 
-                if c == '"' || c == '\'' {
-                    in_string = true;
-                    string_char = c;
-                    tokens.push(RenderToken {
-                        start_col: col,
-                        len: 1,
-                        token_type: 5,
-                    });
-                    col += 1;
-                    continue;
-                }
-
-                // Однострочные комментарии (#)
-                if c == '#' {
-                    tokens.push(RenderToken {
-                        start_col: col,
-                        len: line.len() - col,
-                        token_type: 0,
-                    });
-                    break;
-                }
-
-                // Буквенно-цифровые токены (Ключевые слова, Классы, Функции, Переменные с цифрами)
-                // Сначала обрабатываем слова, чтобы переменные вроде "var2" красились целиком как текст
-                if c.is_alphabetic() || c == '_' {
-                    let start_word_col = col;
-                    let mut word = String::new();
-
-                    while col < line.len() && (line[col].is_alphanumeric() || line[col] == '_') {
-                        word.push(line[col]);
-                        col += 1;
-                    }
-
-                    let token_type = if py_keywords.contains(&word.as_str()) {
-                        6 // Ключевое слово (Синий)
-                    } else if word.chars().next().unwrap().is_uppercase() {
-                        3 // Класс
-                    } else if col < line.len() && line[col] == '(' {
-                        2 // Функция
-                    } else {
-                        99 // Обычная переменная или текст
-                    };
-
-                    if token_type != 99 {
-                        tokens.push(RenderToken {
-                            start_col: start_word_col,
-                            len: col - start_word_col,
-                            token_type,
-                        });
-                    }
-                    continue;
-                }
-
-                // 4. Подсветка обособленных чисел (Важно: идет ПОСЛЕ проверки на буквы)
-                // Токены вроде "42", "3.14" распарсятся здесь, а цифры внутри "x12" уйдут выше в текст
-                if c.is_ascii_digit() {
-                    let start_num_col = col;
-                    
-                    // Считываем цифры и точку (для float-чисел)
-                    while col < line.len() && (line[col].is_ascii_digit() || line[col] == '.') {
-                        col += 1;
-                    }
-
-                    tokens.push(RenderToken {
-                        start_col: start_num_col,
-                        len: col - start_num_col,
-                        token_type: 1, // 1 = Бирюзовый цвет (в get_token_color перенаправляет на ключевые слова)
-                    });
-                    continue;
-                }
-
-                col += 1;
+            // 4. Применяем регулярные выражения с использованием замыкания
+            
+            // Числа (1 = Бирюзовый)
+            for mat in number_regex.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 1);
             }
+
+            // Вызовы функций (8 = ярко-жёлтый) — берем только первую группу (имя функции)
+            for cap in function_call_regex.captures_iter(&line_str) {
+                if let Some(mat) = cap.get(1) {
+                    fill_mask(mat.start(), mat.end(), 8);
+                }
+            }
+
+            // Классы (3 = Подчеркнутый зеленый)
+            for mat in class_name_regex.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 3);
+            }
+
+            // Ключевые слова (6 = Синий)
+            for mat in keywords_regex.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 6);
+            }
+
+            // Строки "" (5 = Желтый)
+            for mat in string_double.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 14);
+            }
+
+            // Строки '' (5 = Желтый)
+            for mat in string_single.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 14);
+            }
+
+            // Комментарии (0 = Серый)
+            for mat in comment_regex.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 0);
+            }
+
+            // 5. Сборка токенов из маски стилей
+            let mut col = 0;
+            while col < line.len() {
+                let current_style = style_mask[col];
+                if current_style != 99 {
+                    let start = col;
+                    while col < line.len() && style_mask[col] == current_style {
+                        col += 1;
+                    }
+                    tokens.push(RenderToken {
+                        start_col: start,
+                        len: col - start,
+                        token_type: current_style,
+                    });
+                } else {
+                    col += 1;
+                }
+            }
+
+            tokens.sort_by_key(|t| t.start_col);
             file_tokens[row_idx] = tokens;
         }
 

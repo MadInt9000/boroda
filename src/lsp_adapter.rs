@@ -48,8 +48,7 @@ impl LspAdapter {
 
     /// Уведомляет сервер об открытии текстового документа
     pub fn did_open(&self, lsp_pool: &[LspClient], text: &str) {
-        if let Some(idx) = ProjectLoader::get_server_index(&self.abs_filename_str) {
-            let client = &lsp_pool[idx];
+        if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
             if !client.is_started() { return; }
 
             let path = Path::new(&self.abs_filename_str);
@@ -86,8 +85,7 @@ impl LspAdapter {
 
     /// Отправляет на сервер измененное содержимое документа (Full Sync)
     pub fn send_change_notification(&self, lsp_pool: &[LspClient], text_content: &str) {
-        if let Some(idx) = ProjectLoader::get_server_index(&self.abs_filename_str) {
-            let client = &lsp_pool[idx];
+        if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
             if !client.is_started() { return; }
 
             let file_url = Url::from_file_path(Path::new(&self.abs_filename_str)).unwrap();
@@ -112,8 +110,7 @@ impl LspAdapter {
 
     /// Отправляет текстовый запрос textDocument/definition на сервер
     pub fn request_definition(&self, lsp_pool: &[LspClient], line: usize, col: usize) {
-        if let Some(idx) = ProjectLoader::get_server_index(&self.abs_filename_str) {
-            let client = &lsp_pool[idx];
+        if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
             if !client.is_started() { return; }
 
             let next_id = Self::next_global_id();
@@ -149,10 +146,9 @@ impl LspAdapter {
             .unwrap_or("");
 
         if ext == "py" {
-            let local_tokens = PythonTokenizer::tokenize_file(lines);
+            let local_tokens = PythonTokenizer::tokenize_text(lines);
             Some(LspParseResult::Tokens(local_tokens))
-        } else if let Some(idx) = ProjectLoader::get_server_index(&self.abs_filename_str) {
-            let client = &lsp_pool[idx];
+        } else if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
             if client.is_started() {
                 let next_id = Self::next_global_id();
                 self.last_tokens_request_id.store(next_id, Ordering::SeqCst);
@@ -167,8 +163,7 @@ impl LspAdapter {
 
     /// Отправляет серверу уведомление о физическом сохранении файла на диск
     pub fn send_save_notification(&self, lsp_pool: &[LspClient]) {
-        if let Some(idx) = ProjectLoader::get_server_index(&self.abs_filename_str) {
-            let client = &lsp_pool[idx];
+        if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
             if !client.is_started() { return; }
 
             let file_url = Url::from_file_path(Path::new(&self.abs_filename_str)).unwrap();
@@ -200,8 +195,7 @@ impl LspAdapter {
         if let Some(id) = lsp_msg.get("id").and_then(|id| id.as_i64()) {
             // id == 1: Фоновый хендшейк инициализации
             if id == 1 {
-                if let Some(idx) = ProjectLoader::get_server_index(&self.abs_filename_str) {
-                    let client = &lsp_pool[idx];
+                if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
                     if client.is_started() {
                         client.send_initialized();
                         self.did_open(lsp_pool, text_content);

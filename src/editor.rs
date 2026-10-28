@@ -2,12 +2,14 @@
 use crate::lsp_adapter::LspAdapter;
 use crate::tokens::RenderToken; // Подключаем единую структуру
 use crate::clipboard::ClipboardManager;
+use crate::config::Configuration;
 use crossterm::{
     cursor,
     event::{Event, KeyCode},
     terminal,
     QueueableCommand,
 };
+use std::cmp;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
@@ -45,10 +47,20 @@ pub struct Editor {
     pub semantic_tokens: Vec<Vec<RenderToken>>,
     // ДОБАВЛЯЕМ СВОЙСТВО: Адаптер конкретного файла
     pub lsp_adapter: Option<LspAdapter>,
+    pub color_palette: Vec<String>,
 }
 
 impl Editor {
     pub fn new(filename: String) -> Self {
+
+        let ext = Path::new(&filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        // Компилируем палитру в вектор один раз при создании редактора
+        let color_palette = Configuration::global().compile_palette_to_vector(ext);
+
         let mut editor = Self {
             filename,
             lines: Vec::new(),
@@ -66,6 +78,7 @@ impl Editor {
             diagnostics: Vec::new(),
             semantic_tokens: Vec::new(),
             lsp_adapter: None, 
+            color_palette,
         };
         editor.reload_file();
         editor
@@ -225,15 +238,39 @@ impl Editor {
         }
         false
     }
-
-    fn get_token_color(&self, token_type: u32) -> &'static str {
+    // ИЗМЕНЕНО: Сверхбыстрый выбор цвета по прямому индексу вектора
+    fn get_token_color(&self, token_type: u32) -> &str {
+        let idx = token_type as usize;
+        
+        // Если индекс в границах вектора — отдаем цвет, иначе — сброс цвета (первый элемент или дефолт)
+        if idx < self.color_palette.len() {
+            &self.color_palette[idx]
+        } else {
+            // Если токен вылетел за пределы, используем системный дефолт (обычно это \x1b[0m)
+            "\x1b[0m"
+        }
+    }
+    
+    fn get_token_color_old(&self, token_type: u32) -> &'static str {
         match token_type {
-            1 | 10 => "\x1b[36m", // Ключевые слова -> Бирюзовый
-            2 | 3 | 4 => "\x1b[32m", // Структуры, Типы -> Зеленый
-            6 => "\x1b[34m", // Функции -> Синий
-            5 | 8 => "\x1b[33m", // Строки -> Желтый
-            7 | 9  => "\x1b[35m", // Хз -> Фиолетовый
-            0 => "\x1b[90m", // Комментарии -> Серый
+            0 => "\x1b[90m",        // Комментарии -> Серый
+            1|10 => "\x1b[0;36m",      // Ключевые слова -> Бирюзовый
+            2|15 => "\x1b[0;32m",      // Структуры, Типы, Классы -> Зеленый
+            3 => "\x1b[3;32m",      // Литералы -> Зеленый НАКЛОННЫЙ
+            4 => "\x1b[0;92m",      // Конструкторы, статичные методы -> Зеленый яркий
+            5 => "\x1b[0;95m",      // Трейты -> Фиолетовый ЯРКИЙ
+            6 => "\x1b[0;96m",      // Операторы -> Бирюзовый ЖИРНЫЙ
+            7 => "\x1b[1;34m",      // Макросы -> Синий ЖИРНЫЙ
+            8 => "\x1b[0;93m",      // Вызываемые методы -> Желтый ЯРКИЙ
+            9 => "\x1b[4;32m",      // Импорты -> Зеленый ПОДЧЕРКНУТЫЙ
+//            10 => "\x1b[1;36m",     // Числа -> Бирюзовый ЖИРНЫЙ
+//            11 => "\x1b[1;0m",     // Операторы -> Серый Жирный
+//            12 => "\x1b[4m",      // Параметры -> Подчеркнутый
+            13 => "\x1b[3m",        // Свойства -> Наклонный
+            14 => "\x1b[0;33m",     // Строки
+//            15 => "\x1b[94m",     // Классы
+            16|18|19|20 => "\x1b[31m",       // ...
+//            17 => "\x1b[",        // Переменная
             _ => "\x1b[0m",
         }
     }
@@ -256,7 +293,7 @@ impl Editor {
             }
             
             if is_err {
-                print!("\x1b[1;31m{}\x1b[0m", c);
+                print!("\x1b[41m{}\x1b[0m", c);
             } else {
                 let mut color = "\x1b[0m";
                 if let Some(tokens) = row_tokens {
@@ -275,47 +312,6 @@ impl Editor {
             }
         }
     }
-
-    fn draw_line_with_lsp_syntax_old(&self, file_row: usize, render_len: usize) {
-        let line = &self.lines[file_row];
-        let row_tokens = self.semantic_tokens.get(file_row);
-    
-        // Индекс текущего проверяемого токена в строке
-        let mut token_idx = 0;
-
-        for col_idx in 0..render_len {
-            let file_col = col_idx + self.col_offset;
-            if file_col >= line.len() { break; }
-            let c = line[file_col];
-
-            // 1. Проверяем диагностику ошибок (она приоритетнее подсветки)
-            let is_err = self.is_error_char(file_row, file_col);
-        
-            if is_err {
-                print!("\x1b[1;31m{}\x1b[0m", c);
-            } else {
-                let mut color = "\x1b[0m";
-
-                if let Some(tokens) = row_tokens {
-                    // Продвигаем указатель токенов вперед, если текущий символ 
-                    // уже находится правее текущего токена
-                    while token_idx < tokens.len() && file_col >= tokens[token_idx].start_col + tokens[token_idx].len {
-                        token_idx += 1;
-                    }
-
-                    // Если нашли токен, в границы которого попадает наш символ — берем его цвет
-                    if token_idx < tokens.len() {
-                        let token = &tokens[token_idx];
-                        if file_col >= token.start_col && file_col < token.start_col + token.len {
-                            color = self.get_token_color(token.token_type);
-                        }
-                    }
-                }
-                print!("{}{}\x1b[0m", color, c);
-            }
-        }
-    }
-
     //pub fn warning_function(&self) {
     // just do nothing
     //}
@@ -329,7 +325,7 @@ impl Editor {
 
         // Левая часть статус-бара: имя файла, количество строк и позиция курсора
         let status_left = format!(
-            " File: {} | Lines: {} | Pos: {},{} | ", 
+            " {} | Lines: {} | Pos: {},{} | ", 
             self.filename, self.lines.len(), self.cursor_y + 1, self.cursor_x + 1
         );
         
@@ -339,7 +335,7 @@ impl Editor {
             status_right.push_str("🛑");
         }
         for _ in 0..self.warning_count {
-            status_right.push_str("⚠️");
+            status_right.push_str("⚠️ ")
         }
         // Добавим финальный пробел для отступа справа, если значки есть
 //        if !status_right.is_empty() {
@@ -398,7 +394,7 @@ impl Editor {
         }
 
         let footer_text = active_error_msg.unwrap_or_else(|| {
-            "F1 TogIdt|F2 Save|F3 Search|F4 GoDef|F5 Copy|F6 Clear|F7 Cut|F8 Paste|F9 Begin|F10 Quit|F11 ExSave|F12 Reload".to_string()
+            "F1 TogIdt|F2 Save|F3 Search|F4 GoDef|F5 Copy|F6 Paste|F7 Clear|F8 Cut|F9 Begin|F10 Quit|F11 ExSave|F12 Reload".to_string()
         });
 
         let render_hints = if footer_text.len() > self.screen_cols as usize {
@@ -553,9 +549,9 @@ impl Editor {
         // 2. Разделяем строку по позиции курсора
         let current_line_mut = &mut self.lines[self.cursor_y];
         let mut next_line = current_line_mut.split_off(self.cursor_x);
-        let mut indent_len = indent_chars.len();
+        let mut indent_len = cmp::min(indent_chars.len(), self.cursor_x);
         // 3. Добавляем скопированный отступ в начало новой строки
-        if self.has_indent {
+        if self.has_indent && self.cursor_x > indent_chars.len() {
             indent_chars.extend(next_line);
             next_line = indent_chars;
         } else {
@@ -663,92 +659,79 @@ impl Editor {
             self.cursor_x = 0;
         }
     }
-
-    /// Возвращает выделенный текст в виде String, либо пустую строку
-    pub fn get_selected_text(&self) -> String {
+    
+    pub fn get_block(&self) -> (usize, usize, usize, usize) {
         if let Some(sel) = self.selection {
             let (p1_y, p1_x) = (sel.start_y, sel.start_x);
             let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
-            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
-                (p1_y, p1_x, p2_y, p2_x)
+            if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+                return (p1_y, p1_x, p2_y, p2_x)
             } else {
-                (p2_y, p2_x, p1_y, p1_x)
+                return (p2_y, p2_x, p1_y, p1_x)
             };
-
-            let mut result = String::new();
-            for y in start_y..=end_y {
-                if y >= self.lines.len() { break; }
-                let line = &self.lines[y];
-                let s_x = if y == start_y { start_x.min(line.len()) } else { 0 };
-                let e_x = if y == end_y { end_x.min(line.len()) } else { line.len() };
-            
-                let segment: String = line[s_x..e_x].iter().collect();
-                result.push_str(&segment);
-                if y < end_y {
-                    result.push('\n');
-                }
-            }
-            result
-        } else {
-            String::new()
         }
+        let line = &self.lines[self.cursor_y];
+        return (self.cursor_y, 0, self.cursor_y, line.len())
+    }
+    
+    /// Возвращает выделенный текст в виде String, либо пустую строку
+    pub fn get_selected_text(&self) -> String {
+        //
+        let (start_y, start_x, end_y, end_x) = self.get_block();
+
+        let mut result = String::new();
+        for y in start_y..=end_y {
+            if y >= self.lines.len() { break; }
+            let line = &self.lines[y];
+            let s_x = if y == start_y { start_x.min(line.len()) } else { 0 };
+            let e_x = if y == end_y { end_x.min(line.len()) } else { line.len() };
+            
+            let segment: String = line[s_x..e_x].iter().collect();
+            result.push_str(&segment);
+            if y < end_y { result.push('\n'); }
+        }
+        
+        result
     }
 
     /// Удаляет выделенный текст, если он есть
     pub fn delete_selection(&mut self) {
-        if let Some(sel) = self.selection {
-            let (p1_y, p1_x) = (sel.start_y, sel.start_x);
-            let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
-            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
-                (p1_y, p1_x, p2_y, p2_x)
-            } else {
-                (p2_y, p2_x, p1_y, p1_x)
-            };
-
-            if start_y == end_y {
-                if start_y < self.lines.len() {
-                    self.lines[start_y].drain(start_x..end_x);
-                    self.semantic_tokens[start_y].clear(); // Сбрасываем кэш токенов измененной строки
-                }
-            } else {
-                // Сложное многострочное удаление
-                let mut remaining_suffix = Vec::new();
-                if end_y < self.lines.len() {
-                    remaining_suffix = self.lines[end_y][end_x..].to_vec();
-                }
-            
-                // Удаляем промежуточные и конечную строки
-                if start_y + 1 < self.lines.len() {
-                    let drain_end = (end_y + 1).min(self.lines.len());
-                    self.lines.drain((start_y + 1)..drain_end);
-                    self.semantic_tokens.drain((start_y + 1)..drain_end);
-                }
-            
-                // Обрезаем стартовую строку и приклеиваем остаток хвоста конечной строки
-                if start_y < self.lines.len() {
-                    self.lines[start_y].truncate(start_x);
-                    self.lines[start_y].extend(remaining_suffix);
-                    self.semantic_tokens[start_y].clear();
-                }
+        let (start_y, start_x, end_y, end_x) = self.get_block();
+        //
+        if start_y == end_y {
+            if start_y < self.lines.len() {
+                self.lines[start_y].drain(start_x..end_x);
+                self.semantic_tokens[start_y].clear(); // Сбрасываем кэш токенов измененной строки
             }
-
-            // Переводим курсор в начало бывшего выделения и сбрасываем его
-            self.cursor_y = start_y;
-            self.cursor_x = start_x;
-            self.selection = None;
+        } else {
+            // Сложное многострочное удаление
+            let mut remaining_suffix = Vec::new();
+            if end_y < self.lines.len() {
+                remaining_suffix = self.lines[end_y][end_x..].to_vec();
+            }
+            
+            // Удаляем промежуточные и конечную строки
+            if start_y + 1 < self.lines.len() {
+                let drain_end = (end_y + 1).min(self.lines.len());
+                self.lines.drain((start_y + 1)..drain_end);
+                self.semantic_tokens.drain((start_y + 1)..drain_end);
+            }
+            // Обрезаем стартовую строку и приклеиваем остаток хвоста конечной строки
+            if start_y < self.lines.len() {
+                self.lines[start_y].truncate(start_x);
+                self.lines[start_y].extend(remaining_suffix);
+                self.semantic_tokens[start_y].clear();
+            }
         }
+        // Переводим курсор в начало бывшего выделения и сбрасываем его
+        self.cursor_y = start_y;
+        self.cursor_x = start_x;
+        self.selection = None;
     }
 
     /// Копирование выделенного фрагмента (или текущей строки, если выделения нет) в ClipboardManager
     pub fn copy_to_clipboard(&self) {
-        let text_to_copy = if self.selection.is_some() {
-            self.get_selected_text()
-        } else {
-            // Если ничего не выделено — копируем текущую строку целиком (поведение F7)
-            let mut line_str: String = self.lines[self.cursor_y].iter().collect();
-            line_str.push('\n');
-            line_str
-        };
+        let text_to_copy =  self.get_selected_text();
     
         if !text_to_copy.is_empty() {
             ClipboardManager::global().set_text(text_to_copy);
@@ -757,24 +740,8 @@ impl Editor {
 
     /// Вырезание (копирование + удаление)
     pub fn cut_to_clipboard(&mut self) {
-        if self.selection.is_some() {
-            self.copy_to_clipboard();
-            self.delete_selection();
-        } else {
-            // Поведение по умолчанию для F7 (вырезать всю строку)
-            self.copy_to_clipboard();
-            if self.lines.len() > 1 {
-                self.lines.remove(self.cursor_y);
-                self.semantic_tokens.remove(self.cursor_y);
-                if self.cursor_y >= self.lines.len() {
-                    self.cursor_y = self.lines.len() - 1;
-                }
-            } else {
-                self.lines[self.cursor_y].clear();
-                self.semantic_tokens[self.cursor_y].clear();
-            }
-            self.cursor_x = 0;
-        }
+        self.copy_to_clipboard();
+        self.delete_selection();
     }
 
     /// Вставка текста из ClipboardManager в позицию курсора

@@ -11,3 +11,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 lsp-types = "0.94" # Официальные типы данных спецификации LSP
 arboard = "3.4"
+regex = "1.10" 

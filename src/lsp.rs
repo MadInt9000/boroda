@@ -8,7 +8,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 pub struct LspClient {
-    pub server_command: &'static str,
+    // Храним идентификатор сервера из конфига (например, "python", "rust")
+    pub server_id: String,
     // Внутреннее состояние скрыто под синхронным Mutex
     inner: Mutex<LspClientState>,
 }
@@ -20,10 +21,10 @@ struct LspClientState {
 }
 
 impl LspClient {
-    /// Создает преднастроенный клиент в состоянии "не запущен"
-    pub fn new_stub(server_command: &'static str) -> Self {
+    /// Создает преднастроенный клиент на основе имени из конфига
+    pub fn new_stub(server_id: String) -> Self {
         Self {
-            server_command,
+            server_id,
             inner: Mutex::new(LspClientState {
                 is_started: false,
                 tx: None,
@@ -47,10 +48,19 @@ impl LspClient {
         }
 
         // 2. Синхронно настраиваем и запускаем процесс через Command::spawn
-        let mut cmd = Command::new(self.server_command);
-        if self.server_command.contains("pyright") || self.server_command.contains("intelephense") {
-            cmd.arg("--stdio");
-        }
+        // Извлекаем настройки конкретного сервера из нашей конфигурации
+        let config = crate::config::Configuration::global();
+        let server_config = match config.lsp_servers.get(&self.server_id) {
+            Some(cfg) => cfg,
+            None => {
+                // Если настроек для сервера нет, не запускаем процесс
+                return;
+            }
+        };
+
+        let mut cmd = Command::new(&server_config.command);
+        // Добавляем кастомные аргументы из JSON (например, ["--stdio"])
+        cmd.args(&server_config.args);
 
         let mut child = cmd
             .current_dir(current_dir)

@@ -1,6 +1,6 @@
 use crate::editor::{Editor, Selection};
 use crate::lsp::LspClient;
-use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use std::io;
 
 pub struct InputDriver;
@@ -40,6 +40,7 @@ impl InputDriver {
                         KeyCode::PageDown => { InputDriver::next_editor(editors, current_idx); return Ok(()); }
                         KeyCode::Left => { editor.move_word_left(); return Ok(()); }
                         KeyCode::Right => { editor.move_word_right(); return Ok(()); }
+                        KeyCode::Insert => editor.paste_from_clipboard(),
                         _ => {}
                     }
                 }
@@ -57,11 +58,11 @@ impl InputDriver {
                             lsp.request_definition(lsp_pool, editor.cursor_y, editor.cursor_x);
                         }
                     }
-                    KeyCode::F(6)  => editor.clear_current_line(),
+                    KeyCode::F(7)  => editor.clear_current_line(),
                     KeyCode::F(5)  => editor.copy_to_clipboard(),
                     // Перенаправляем на новые методы умного клипборда
-                    KeyCode::F(7)  => editor.cut_to_clipboard(),
-                    KeyCode::F(8)  => editor.paste_from_clipboard(),
+                    KeyCode::F(8)  => editor.cut_to_clipboard(),
+                    KeyCode::F(6)  => editor.paste_from_clipboard(),
                     
                     KeyCode::F(9)  => editor.move_to_line_start(),
                     KeyCode::F(10) => editor.quit(),
@@ -139,7 +140,7 @@ impl InputDriver {
                                     lsp_pool, 
                                     editor.row_offset + mouse_event.row as usize - 1, 
                                     editor.col_offset + mouse_event.column as usize
-                                    );
+                                );
                             }
                         }
                     }

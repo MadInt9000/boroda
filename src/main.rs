@@ -4,11 +4,16 @@ mod input;
 mod lsp;
 mod lsp_adapter;
 mod python_tokenizer;
+mod markdown_tokenizer;
+mod config_tokenizer;
 mod loader;
 mod clipboard;
+mod config;
 use input::InputDriver;
 use loader::ProjectLoader;
-
+use markdown_tokenizer::MarkdownTokenizer;
+use config_tokenizer::ConfigTokenizer;
+use config::Configuration;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, EventStream},
     execute,
@@ -74,7 +79,8 @@ async fn main() -> io::Result<()> {
             // Ветка 2: В цикле Debounce
             _ = tokio::time::sleep(timeout_duration), if has_pending_changes => {
                 let active_editor = &mut editors[current_editor_idx];
-    
+                let ext = std::path::Path::new(&active_editor.filename).extension().and_then(|s| s.to_str()).unwrap_or("");
+
                 if let Some(ref lsp) = active_editor.lsp_adapter {
                     let text_content = active_editor.get_all_text();
         
@@ -84,6 +90,14 @@ async fn main() -> io::Result<()> {
                     if let Some(LspParseResult::Tokens(local_tokens)) = lsp.request_syntax_tokens(&lsp_pool, &active_editor.lines) {
                         active_editor.update_semantic_tokens(local_tokens);
                     }
+                } else if ext == "md" {
+                    // НОВОЕ: Пересчитываем локальные Markdown токены при изменении текста
+                    let local_tokens = MarkdownTokenizer::tokenize_text(&active_editor.lines);
+                    active_editor.update_semantic_tokens(local_tokens);
+                } else if matches!(ext, "json" | "toml" | "ini" | "conf") {
+                    // НОВОЕ: Пересчитываем токены конфигурации при редактировании
+                    let local_tokens = ConfigTokenizer::tokenize_text(&active_editor.lines);
+                    active_editor.update_semantic_tokens(local_tokens);
                 }
                 has_pending_changes = false;
             }
