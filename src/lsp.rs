@@ -16,6 +16,7 @@ pub struct LspClient {
 
 struct LspClientState {
     is_started: bool,
+    is_initialized: bool,
     tx: Option<mpsc::UnboundedSender<String>>,
     _process: Option<Child>,
 }
@@ -27,6 +28,7 @@ impl LspClient {
             server_id,
             inner: Mutex::new(LspClientState {
                 is_started: false,
+                is_initialized: false,
                 tx: None,
                 _process: None,
             }),
@@ -181,7 +183,20 @@ impl LspClient {
         self.send_raw_message(json_str);
     }
 
-    pub fn send_initialized(&self) {
+    /// Отправляет уведомление `initialized` ровно один раз за время жизни процесса.
+    /// Возвращает true, если уведомление действительно было отправлено.
+    pub fn send_initialized(&self) -> bool {
+        let mut state = self.inner.lock().unwrap();
+
+        // Сервер не запущен или мы уже проходили хендшейк — повторно не шлем
+        if !state.is_started || state.is_initialized {
+            return false;
+        }
+
+        // Ставим флаг до отправки, чтобы исключить повторную отправку
+        state.is_initialized = true;
+        drop(state);
+
         let msg = json!({
             "jsonrpc": "2.0",
             "method": "initialized",
@@ -189,6 +204,7 @@ impl LspClient {
         });
         let json_str = serde_json::to_string(&msg).unwrap();
         self.send_raw_message(json_str);
+        true
     }
 
     pub fn request_semantic_tokens_with_id(&self, filename: &str, request_id: i64) {

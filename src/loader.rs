@@ -65,35 +65,36 @@ impl ProjectLoader {
             }
         });
         let abs_filename_str = abs_path.to_string_lossy().into_owned();
-        let mut editor = Editor::new(abs_filename_str);
-        let ext = Path::new(&editor.filename).extension().and_then(|s| s.to_str()).unwrap_or("");
+        let mut editor = Editor::new(abs_filename_str.clone());
+        editor.file.filename = abs_filename_str;
+        let ext = Path::new(&editor.file.filename).extension().and_then(|s| s.to_str()).unwrap_or("");
         
         // Получаем прямую ссылку на клиент вместо индекса
-        if let Some(client) = Self::get_server_client(&editor.filename, lsp_pool) {
-            let adapter = LspAdapter::new(editor.filename.clone());
+        if let Some(client) = Self::get_server_client(&editor.file.filename, lsp_pool) {
+            let adapter = LspAdapter::new(editor.file.filename.clone());
             
             // Запускаем сервер напрямую через ссылку
             client.start(current_dir, global_tx);
-            editor.lsp_adapter = Some(adapter);
+            editor.file.lsp_adapter = Some(adapter);
             
             // Проверяем по строковому ID
             if client.server_id == "python" {
-                let local_tokens = PythonTokenizer::tokenize_text(&editor.lines);
-                editor.update_semantic_tokens(local_tokens);
+                let local_tokens = PythonTokenizer::tokenize_text(&editor.base.lines);
+                editor.base.update_semantic_tokens(local_tokens);
             }
         } else if ext == "md" {
             // НОВОЕ: Если это Markdown-файл, запускаем наш локальный токенизатор
-            let local_tokens = MarkdownTokenizer::tokenize_text(&editor.lines);
-            editor.update_semantic_tokens(local_tokens); 
+            let local_tokens = MarkdownTokenizer::tokenize_text(&editor.base.lines);
+            editor.base.update_semantic_tokens(local_tokens); 
         } else if matches!(ext, "json" | "toml" | "ini" | "conf") {
             // НОВОЕ: Парсим конфигурационные файлы при первичной загрузке
-            let local_tokens = ConfigTokenizer::tokenize_text(&editor.lines);
-            editor.update_semantic_tokens(local_tokens);
+            let local_tokens = ConfigTokenizer::tokenize_text(&editor.base.lines);
+            editor.base.update_semantic_tokens(local_tokens);
         }
 
 
-        let _ = editor.update_window_size();
-        editor.scroll();
+        let _ = editor.base.update_window_size();
+        editor.base.scroll();
         editor
     }
 

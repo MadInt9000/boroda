@@ -1,6 +1,5 @@
-use crate::editor::LspDiagnostic;
 use crate::lsp::LspClient;
-use crate::tokens::RenderToken;
+use crate::tokens::{LspDiagnostic, RenderToken};
 use crate::python_tokenizer::PythonTokenizer;
 use crate::loader::ProjectLoader;
 use lsp_types::Url;
@@ -230,7 +229,7 @@ impl LspAdapter {
                                     let abs_path = path.to_string_lossy().into_owned();
                                     let start = range.get("start");
                                     let line = Self::extract_pos(start, "line");
-                                    let col = Self::extract_pos(start, "character");;
+                                    let col = Self::extract_pos(start, "character");
 
                                     return Some(LspParseResult::Definition { abs_path, line, col });
                                 }

@@ -1,0 +1,989 @@
+use crate::clipboard::ClipboardManager;
+use crate::tokens::{LspDiagnostic, RenderToken, Selection};
+use crate::traits::TextInteractive;
+use crossterm::{
+    cursor,
+    event::{Event, KeyCode},
+    style::Print,
+    terminal,
+    QueueableCommand,
+};
+use std::cmp;
+use std::future::Future;
+use std::io::{self, Write};
+use std::pin::Pin;
+
+pub struct BaseEditor {
+    pub filename: String,
+    pub lines: Vec<Vec<char>>,
+    pub cursor_x: usize,
+    pub cursor_y: usize,
+    pub row_offset: usize,
+    pub col_offset: usize,
+    pub screen_cols: u16,
+    pub screen_rows: u16,
+    pub has_indent: bool,
+    pub should_quit: bool,
+    pub selection: Option<Selection>,
+    pub error_count: usize,
+    pub warning_count: usize,
+    pub diagnostics: Vec<LspDiagnostic>,
+    // Каждому элементу lines соответствует свой вектор токенов
+    pub semantic_tokens: Vec<Vec<RenderToken>>,
+    pub color_palette: Vec<String>,
+}
+
+impl BaseEditor {
+    pub fn new(filename: String, color_palette: Vec<String>) -> Self {
+        Self {
+            filename,
+            lines: vec![Vec::new()],
+            cursor_x: 0,
+            cursor_y: 0,
+            row_offset: 0,
+            col_offset: 0,
+            screen_cols: 0,
+            screen_rows: 0,
+            has_indent: true,
+            should_quit: false,
+            selection: None,
+            error_count: 0,
+            warning_count: 0,
+            diagnostics: Vec::new(),
+            semantic_tokens: vec![Vec::new()],
+            color_palette,
+        }
+    }
+
+    pub fn get_all_text(&self) -> String {
+        let mut full_text = String::new();
+        for line in &self.lines {
+            let s: String = line.iter().collect();
+            full_text.push_str(&s);
+            full_text.push('\n');
+        }
+        full_text
+    }
+
+    pub fn load_lines(&mut self, new_lines: Vec<Vec<char>>) {
+        self.lines = if new_lines.is_empty() {
+            vec![Vec::new()]
+        } else {
+            new_lines
+        };
+
+        // Синхронизируем размер индекса токенов с количеством строк
+        self.semantic_tokens = vec![Vec::new(); self.lines.len()];
+        self.selection = None;
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.row_offset = 0;
+        self.col_offset = 0;
+        self.diagnostics.clear();
+    }
+
+    pub fn update_window_size(&mut self) -> io::Result<()> {
+        let (cols, rows) = terminal::size()?;
+        self.screen_cols = cols;
+        self.screen_rows = rows;
+        Ok(())
+    }
+
+    pub fn update_semantic_tokens(&mut self, tokens: Vec<Vec<RenderToken>>) {
+        self.semantic_tokens = tokens;
+    }
+
+    pub fn set_diagnostics(
+        &mut self,
+        errors: usize,
+        warnings: usize,
+        diagnostics: Vec<LspDiagnostic>,
+    ) {
+        self.error_count = errors;
+        self.warning_count = warnings;
+        self.diagnostics = diagnostics;
+    }
+
+    pub fn scroll(&mut self) {
+        let text_rows = self.screen_rows.saturating_sub(2) as usize;
+
+        if self.cursor_y < self.row_offset {
+            self.row_offset = self.cursor_y;
+        }
+        if self.cursor_y >= self.row_offset + text_rows {
+            self.row_offset = self.cursor_y - text_rows + 1;
+        }
+
+        if self.cursor_x < self.col_offset {
+            self.col_offset = self.cursor_x;
+        }
+        if self.cursor_x >= self.col_offset + self.screen_cols as usize {
+            self.col_offset = self.cursor_x - self.screen_cols as usize + 1;
+        }
+    }
+
+    fn is_error_char(&self, row: usize, col: usize) -> bool {
+        for diag in &self.diagnostics {
+            if row > diag.start_line && row < diag.end_line {
+                return true;
+            }
+            if row == diag.start_line && row < diag.end_line && col >= diag.start_col {
+                return true;
+            }
+            if row == diag.end_line && row > diag.start_line && col < diag.end_col {
+                return true;
+            }
+            if row == diag.start_line && row == diag.end_line {
+                if col >= diag.start_col && col < diag.end_col {
+                    return true;
+                }
+                if let Some(line) = self.lines.get(row) {
+                    if diag.start_col >= line.len() && col == line.len().saturating_sub(1) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn is_inside_selection(&self, row: usize, col: usize) -> bool {
+        if let Some(sel) = self.selection {
+            // Нормализуем start и end, так как выделять можно в любом направлении
+            let (p1_y, p1_x) = (sel.start_y, sel.start_x);
+            let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
+
+            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+                (p1_y, p1_x, p2_y, p2_x)
+            } else {
+                (p2_y, p2_x, p1_y, p1_x)
+            };
+
+            if row < start_y || row > end_y {
+                return false;
+            }
+            if row == start_y && row == end_y {
+                return col >= start_x && col < end_x;
+            }
+            if row == start_y {
+                return col >= start_x;
+            }
+            if row == end_y {
+                return col < end_x;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn get_token_color(&self, token_type: u32) -> &str {
+        let idx = token_type as usize;
+
+        if idx < self.color_palette.len() {
+            &self.color_palette[idx]
+        } else {
+            "\x1b[0m"
+        }
+    }
+
+    fn draw_line_with_lsp_syntax(
+        &self,
+        file_row: usize,
+        render_len: usize,
+        stdout: &mut io::Stdout,
+    ) -> io::Result<()> {
+        let line = &self.lines[file_row];
+        let row_tokens = self.semantic_tokens.get(file_row);
+        let mut token_idx = 0;
+        let mut output = String::new();
+
+        for col_idx in 0..render_len {
+            let file_col = col_idx + self.col_offset;
+            if file_col >= line.len() {
+                break;
+            }
+            let c = line[file_col];
+
+            let is_err = self.is_error_char(file_row, file_col);
+            let is_sel = self.is_inside_selection(file_row, file_col);
+
+            if is_sel {
+                output.push_str("\x1b[7m");
+                output.push(c);
+                output.push_str("\x1b[m");
+                continue;
+            }
+
+            if is_err {
+                output.push_str("\x1b[41m");
+                output.push(c);
+                output.push_str("\x1b[0m");
+            } else {
+                let mut color = "\x1b[0m";
+                if let Some(tokens) = row_tokens {
+                    while token_idx < tokens.len()
+                        && file_col >= tokens[token_idx].start_col + tokens[token_idx].len
+                    {
+                        token_idx += 1;
+                    }
+                    if token_idx < tokens.len() {
+                        let token = &tokens[token_idx];
+                        if file_col >= token.start_col
+                            && file_col < token.start_col + token.len
+                        {
+                            color = self.get_token_color(token.token_type);
+                        }
+                    }
+                }
+
+                output.push_str(color);
+                output.push(c);
+                output.push_str("\x1b[0m");
+            }
+        }
+
+        stdout.queue(Print(output))?;
+        Ok(())
+    }
+
+    pub fn draw(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
+        let _ = stdout.queue(cursor::Hide);
+
+        // 1. Статус-бар
+        stdout.queue(cursor::MoveTo(0, 0))?;
+
+        let status_left = format!(
+            " {} | Lines: {} | Pos: {},{} | ",
+            self.title(),
+            self.lines.len(),
+            self.cursor_y + 1,
+            self.cursor_x + 1
+        );
+
+        let mut status_right = String::new();
+        for _ in 0..self.error_count {
+            status_right.push_str("🛑");
+        }
+        for _ in 0..self.warning_count {
+            status_right.push_str("⚠️ ")
+        }
+
+        let right_visual_len = (self.error_count * 2)
+            + (self.warning_count * 2)
+            + if status_right.is_empty() { 0 } else { 1 };
+        let total_used = status_left.len() + right_visual_len;
+
+        let fill_len = (self.screen_cols as usize).saturating_sub(total_used);
+        let fill = " ".repeat(fill_len);
+
+        let full_status = format!("{}{}{}", status_left, status_right, fill);
+
+        let render_status = if full_status.chars().count() > self.screen_cols as usize {
+            full_status
+                .chars()
+                .take(self.screen_cols as usize)
+                .collect::<String>()
+        } else {
+            full_status
+        };
+        stdout.queue(Print(format!("\x1b[7m{}\x1b[m", render_status)))?;
+
+        // 2. Отображение текста с подсветкой синтаксиса
+        let text_rows = self.screen_rows.saturating_sub(2) as usize;
+        for i in 0..text_rows {
+            let file_row = i + self.row_offset;
+            stdout.queue(cursor::MoveTo(0, i as u16 + 1))?;
+
+            if file_row < self.lines.len() {
+                let line = &self.lines[file_row];
+                if line.len() > self.col_offset {
+                    let render_len =
+                        (line.len() - self.col_offset).min(self.screen_cols as usize);
+                    self.draw_line_with_lsp_syntax(file_row, render_len, stdout)?;
+                }
+                stdout.queue(Print("\x1b[K"))?;
+            } else {
+                stdout.queue(Print("\x1b[K"))?;
+            }
+        }
+
+        // 3. Подсказки
+        stdout.queue(cursor::MoveTo(0, self.screen_rows - 1))?;
+        let mut active_error_msg = None;
+        for diag in &self.diagnostics {
+            if self.cursor_y == diag.start_line {
+                active_error_msg = Some(format!("⚠️ {}", diag.message.replace('\n', " ")));
+                break;
+            }
+        }
+
+        let footer_text = active_error_msg.unwrap_or_else(|| {
+            // 12 хинтов растягиваем на всю ширину терминала:
+            // каждому хинту достается screen_cols / 12 знакомест,
+            // недостающие пробелы добавляем справа.
+            let hints = [
+                "F1 TogIdt", "F2 Save", "F3 Search", "F4 GoDef",
+                "F5 Copy", "F6 Paste", "F7 Clear", "F8 Cut",
+                "F9 Begin", "F10 Quit", "F11 ExSave", "F12 Reload",
+            ];
+            let screen_cols = self.screen_cols as usize;
+            let slot_width = screen_cols / hints.len();
+            let mut bar = String::with_capacity(screen_cols);
+
+            for hint in hints {
+                let used = hint.chars().count();
+                bar.push_str(hint);
+                if used < slot_width {
+                    bar.push_str(&" ".repeat(slot_width - used));
+                }
+            }
+
+            // Остаток от деления ширины на 12 добавляем в конец
+            let bar_len = bar.chars().count();
+            if bar_len < screen_cols {
+                bar.push_str(&" ".repeat(screen_cols - bar_len));
+            }
+
+            bar
+        });
+
+        let screen_cols = self.screen_cols as usize;
+        let render_hints: String = if footer_text.chars().count() > screen_cols {
+            footer_text.chars().take(screen_cols).collect()
+        } else {
+            footer_text
+        };
+        let fill_hint = " ".repeat(screen_cols.saturating_sub(render_hints.chars().count()));
+        stdout.queue(Print(format!("\x1b[7m{}{}\x1b[m", render_hints, fill_hint)))?;
+
+        let render_x = self.cursor_x.saturating_sub(self.col_offset) as u16;
+        let render_y = (self.cursor_y.saturating_sub(self.row_offset) + 1) as u16;
+        stdout.queue(cursor::MoveTo(render_x, render_y))?;
+        stdout.queue(cursor::Show)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    pub fn click_mouse(&mut self, x: u16, y: u16) {
+        let text_rows = self.screen_rows.saturating_sub(2);
+        if y >= 1 && y <= text_rows {
+            let target_file_row = (y - 1) as usize + self.row_offset;
+            if target_file_row < self.lines.len() {
+                self.cursor_y = target_file_row;
+                let target_file_col = x as usize + self.col_offset;
+                self.cursor_x = target_file_col.min(self.lines[self.cursor_y].len());
+            }
+        }
+    }
+
+    pub fn quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    pub fn clear_current_line(&mut self) {
+        if !self.lines.is_empty() {
+            self.lines[self.cursor_y].clear();
+            self.semantic_tokens[self.cursor_y].clear();
+            self.cursor_x = 0;
+        }
+    }
+
+    pub fn move_to_line_start(&mut self) {
+        self.cursor_x = 0;
+    }
+
+    pub fn move_to_line_end(&mut self) {
+        self.cursor_x = self.lines[self.cursor_y].len();
+    }
+
+    pub fn page_up(&mut self) {
+        let steps = self.screen_rows.saturating_sub(2) as usize;
+        self.cursor_y = self.cursor_y.saturating_sub(steps);
+        self.cursor_x = self.cursor_x.min(self.lines[self.cursor_y].len());
+    }
+
+    pub fn page_down(&mut self) {
+        let steps = self.screen_rows.saturating_sub(2) as usize;
+        self.cursor_y = (self.cursor_y + steps).min(self.lines.len() - 1);
+        self.cursor_x = self.cursor_x.min(self.lines[self.cursor_y].len());
+    }
+
+    pub fn move_up(&mut self) {
+        if self.cursor_y > 0 {
+            self.cursor_y -= 1;
+            self.cursor_x = self.cursor_x.min(self.lines[self.cursor_y].len());
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.cursor_y < self.lines.len() - 1 {
+            self.cursor_y += 1;
+            self.cursor_x = self.cursor_x.min(self.lines[self.cursor_y].len());
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor_x > 0 {
+            self.cursor_x -= 1;
+        } else if self.cursor_y > 0 {
+            self.cursor_y -= 1;
+            self.cursor_x = self.lines[self.cursor_y].len();
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor_x < self.lines[self.cursor_y].len() {
+            self.cursor_x += 1;
+        } else if self.cursor_y < self.lines.len() - 1 {
+            self.cursor_y += 1;
+            self.cursor_x = 0;
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        self.lines[self.cursor_y].insert(self.cursor_x, c);
+        self.cursor_x += 1;
+    }
+
+    pub fn delete_char_at_cursor(&mut self) {
+        if self.cursor_x < self.lines[self.cursor_y].len() {
+            self.lines[self.cursor_y].remove(self.cursor_x);
+        }
+    }
+
+    pub fn delete_char(&mut self) {
+        if self.cursor_x > 0 {
+            self.lines[self.cursor_y].remove(self.cursor_x - 1);
+            self.cursor_x -= 1;
+        } else if self.cursor_y > 0 {
+            self.semantic_tokens.remove(self.cursor_y);
+            let current_line = self.lines.remove(self.cursor_y);
+            self.cursor_y -= 1;
+            self.cursor_x = self.lines[self.cursor_y].len();
+            self.lines[self.cursor_y].extend(current_line);
+        }
+    }
+
+    pub fn insert_newline(&mut self) {
+        // 1. Определяем отступ текущей строки до переноса
+        let current_line = &self.lines[self.cursor_y];
+        let mut indent_chars = Vec::new();
+
+        for &c in current_line.iter() {
+            if c == ' ' || c == '\t' {
+                indent_chars.push(c);
+            } else {
+                break;
+            }
+        }
+
+        // 2. Разделяем строку по позиции курсора
+        let current_line_mut = &mut self.lines[self.cursor_y];
+        let mut next_line = current_line_mut.split_off(self.cursor_x);
+        let mut indent_len = cmp::min(indent_chars.len(), self.cursor_x);
+        // 3. Добавляем скопированный отступ в начало новой строки
+        if self.has_indent && self.cursor_x > indent_chars.len() {
+            indent_chars.extend(next_line);
+            next_line = indent_chars;
+        } else {
+            indent_len = 0
+        }
+
+        // 4. Вставляем новую строку и пустой слот для токенов подсветки
+        self.lines.insert(self.cursor_y + 1, next_line);
+        self.semantic_tokens.insert(self.cursor_y + 1, Vec::new());
+
+        // 5. Переводим курсор на новую строку, смещая его на длину автоотступа
+        self.cursor_y += 1;
+        self.cursor_x = indent_len;
+    }
+
+    pub fn toggle_indent(&mut self) {
+        self.has_indent = !self.has_indent;
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.lines[self.cursor_y].insert(self.cursor_x, c);
+            self.cursor_x += 1;
+        }
+    }
+
+    pub fn move_word_left(&mut self) {
+        let current_line_idx = self.cursor_y;
+        let line = &self.lines[current_line_idx];
+        let tokens = self.semantic_tokens.get(current_line_idx);
+
+        // Сценарий А: Если у нас есть семантические токены от LSP/Лексера
+        if let Some(toks) = tokens {
+            if !toks.is_empty() {
+                let mut target_x = 0;
+                for token in toks.iter().rev() {
+                    if token.start_col < self.cursor_x {
+                        target_x = token.start_col;
+                        break;
+                    }
+                }
+                if target_x == 0 && self.cursor_x == 0 && self.cursor_y > 0 {
+                    self.cursor_y -= 1;
+                    self.cursor_x = self.lines[self.cursor_y].len();
+                } else {
+                    self.cursor_x = target_x;
+                }
+                return;
+            }
+        }
+
+        // Сценарий Б: Фоллбэк — прыгаем по пробелам
+        if self.cursor_x > 0 {
+            let mut x = self.cursor_x - 1;
+            while x > 0 && (line[x] == ' ' || line[x] == '\t') {
+                x -= 1;
+            }
+            while x > 0 && line[x] != ' ' && line[x] != '\t' {
+                x -= 1;
+            }
+            if x > 0 || (line[x] == ' ' || line[x] == '\t') {
+                self.cursor_x = x + 1;
+            } else {
+                self.cursor_x = 0;
+            }
+        } else if self.cursor_y > 0 {
+            self.cursor_y -= 1;
+            self.cursor_x = self.lines[self.cursor_y].len();
+        }
+    }
+
+    pub fn move_word_right(&mut self) {
+        let current_line_idx = self.cursor_y;
+        let line = &self.lines[current_line_idx];
+        let tokens = self.semantic_tokens.get(current_line_idx);
+
+        // Сценарий А: Перемещение по LSP-токенам
+        if let Some(toks) = tokens {
+            if !toks.is_empty() {
+                let mut target_x = line.len();
+                for token in toks {
+                    if token.start_col > self.cursor_x {
+                        target_x = token.start_col;
+                        break;
+                    }
+                }
+                if target_x == line.len()
+                    && self.cursor_x == line.len()
+                    && self.cursor_y < self.lines.len() - 1
+                {
+                    self.cursor_y += 1;
+                    self.cursor_x = 0;
+                } else {
+                    self.cursor_x = target_x;
+                }
+                return;
+            }
+        }
+
+        // Сценарий Б: Фоллбэк по пробелам
+        if self.cursor_x < line.len() {
+            let mut x = self.cursor_x;
+            while x < line.len() && line[x] != ' ' && line[x] != '\t' {
+                x += 1;
+            }
+            while x < line.len() && (line[x] == ' ' || line[x] == '\t') {
+                x += 1;
+            }
+            self.cursor_x = x;
+        } else if self.cursor_y < self.lines.len() - 1 {
+            self.cursor_y += 1;
+            self.cursor_x = 0;
+        }
+    }
+
+    pub fn get_block(&self) -> (usize, usize, usize, usize) {
+        if let Some(sel) = self.selection {
+            let (p1_y, p1_x) = (sel.start_y, sel.start_x);
+            let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
+            if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+                return (p1_y, p1_x, p2_y, p2_x);
+            } else {
+                return (p2_y, p2_x, p1_y, p1_x);
+            }
+        }
+        let line = &self.lines[self.cursor_y];
+        (self.cursor_y, 0, self.cursor_y, line.len())
+    }
+
+    /// Возвращает выделенный текст в виде String, либо текущую строку
+    pub fn get_selected_text(&self) -> String {
+        let (start_y, start_x, end_y, end_x) = self.get_block();
+
+        let mut result = String::new();
+        for y in start_y..=end_y {
+            if y >= self.lines.len() {
+                break;
+            }
+            let line = &self.lines[y];
+            let s_x = if y == start_y {
+                start_x.min(line.len())
+            } else {
+                0
+            };
+            let e_x = if y == end_y {
+                end_x.min(line.len())
+            } else {
+                line.len()
+            };
+
+            let segment: String = line[s_x..e_x].iter().collect();
+            result.push_str(&segment);
+            if y < end_y {
+                result.push('\n');
+            }
+        }
+
+        result
+    }
+
+    /// Удаляет выделенный текст, если он есть
+    pub fn delete_selection(&mut self) {
+        let (start_y, start_x, end_y, end_x) = self.get_block();
+
+        if start_y == end_y {
+            if start_y < self.lines.len() {
+                self.lines[start_y].drain(start_x..end_x);
+                self.semantic_tokens[start_y].clear();
+            }
+        } else {
+            let mut remaining_suffix = Vec::new();
+            if end_y < self.lines.len() {
+                remaining_suffix = self.lines[end_y][end_x..].to_vec();
+            }
+
+            if start_y + 1 < self.lines.len() {
+                let drain_end = (end_y + 1).min(self.lines.len());
+                self.lines.drain((start_y + 1)..drain_end);
+                self.semantic_tokens.drain((start_y + 1)..drain_end);
+            }
+            if start_y < self.lines.len() {
+                self.lines[start_y].truncate(start_x);
+                self.lines[start_y].extend(remaining_suffix);
+                self.semantic_tokens[start_y].clear();
+            }
+        }
+
+        self.cursor_y = start_y;
+        self.cursor_x = start_x;
+        self.selection = None;
+    }
+
+    /// Копирование выделенного фрагмента (или текущей строки) в ClipboardManager
+    pub fn copy_to_clipboard(&self) {
+        let text_to_copy = self.get_selected_text();
+
+        if !text_to_copy.is_empty() {
+            ClipboardManager::global().set_text(text_to_copy);
+        }
+    }
+
+    /// Вырезание (копирование + удаление)
+    pub fn cut_to_clipboard(&mut self) {
+        self.copy_to_clipboard();
+        self.delete_selection();
+    }
+
+    /// Вставка текста из ClipboardManager в позицию курсора
+    pub fn paste_from_clipboard(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+        }
+
+        let text = ClipboardManager::global().get_text();
+        if text.is_empty() {
+            return;
+        }
+
+        let insert_lines: Vec<&str> = text.split('\n').collect();
+
+        if insert_lines.len() == 1 {
+            let chars: Vec<char> = insert_lines[0].chars().collect();
+            let len = chars.len();
+            self.lines[self.cursor_y].splice(self.cursor_x..self.cursor_x, chars);
+            self.semantic_tokens[self.cursor_y].clear();
+            self.cursor_x += len;
+        } else {
+            let current_line = &mut self.lines[self.cursor_y];
+            let tail: Vec<char> = current_line.split_off(self.cursor_x);
+
+            current_line.extend(insert_lines[0].chars());
+            self.semantic_tokens[self.cursor_y].clear();
+
+            let mut insert_idx = self.cursor_y + 1;
+
+            for &middle_line in &insert_lines[1..insert_lines.len() - 1] {
+                let chars: Vec<char> = middle_line.chars().collect();
+                self.lines.insert(insert_idx, chars);
+                self.semantic_tokens.insert(insert_idx, Vec::new());
+                insert_idx += 1;
+            }
+
+            let mut last_inserted_line: Vec<char> =
+                insert_lines.last().unwrap().chars().collect();
+            let last_line_len = last_inserted_line.len();
+            last_inserted_line.extend(tail);
+
+            self.lines.insert(insert_idx, last_inserted_line);
+            self.semantic_tokens.insert(insert_idx, Vec::new());
+
+            self.cursor_y = insert_idx;
+            self.cursor_x = last_line_len;
+        }
+    }
+
+    pub fn begin_selection(&mut self) {
+        if self.selection.is_none() {
+            self.selection = Some(Selection {
+                start_x: self.cursor_x,
+                start_y: self.cursor_y,
+            });
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn set_cursor(&mut self, y: usize, x: usize) {
+        self.cursor_y = y.min(self.lines.len().saturating_sub(1));
+        self.cursor_x = x.min(self.lines[self.cursor_y].len());
+        self.selection = None;
+    }
+}
+
+impl TextInteractive for BaseEditor {
+    fn title(&self) -> &str {
+        &self.filename
+    }
+
+    fn lines(&self) -> &Vec<Vec<char>> {
+        &self.lines
+    }
+
+    fn get_all_text(&self) -> String {
+        self.get_all_text()
+    }
+
+    fn load_lines(&mut self, lines: Vec<Vec<char>>) {
+        self.load_lines(lines)
+    }
+
+    fn update_window_size(&mut self) -> io::Result<()> {
+        self.update_window_size()
+    }
+
+    fn scroll(&mut self) {
+        self.scroll()
+    }
+
+    fn draw(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
+        self.draw(stdout)
+    }
+
+    fn update_semantic_tokens(&mut self, tokens: Vec<Vec<RenderToken>>) {
+        self.update_semantic_tokens(tokens)
+    }
+
+    fn set_diagnostics(
+        &mut self,
+        errors: usize,
+        warnings: usize,
+        diagnostics: Vec<LspDiagnostic>,
+    ) {
+        self.set_diagnostics(errors, warnings, diagnostics)
+    }
+
+    fn cursor_x(&self) -> usize {
+        self.cursor_x
+    }
+
+    fn cursor_y(&self) -> usize {
+        self.cursor_y
+    }
+
+    fn row_offset(&self) -> usize {
+        self.row_offset
+    }
+
+    fn col_offset(&self) -> usize {
+        self.col_offset
+    }
+
+    fn set_cursor(&mut self, y: usize, x: usize) {
+        self.set_cursor(y, x)
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    fn begin_selection(&mut self) {
+        self.begin_selection()
+    }
+
+    fn clear_selection(&mut self) {
+        self.clear_selection()
+    }
+
+    fn click_mouse(&mut self, x: u16, y: u16) {
+        self.click_mouse(x, y)
+    }
+
+    fn move_up(&mut self) {
+        self.move_up()
+    }
+
+    fn move_down(&mut self) {
+        self.move_down()
+    }
+
+    fn move_left(&mut self) {
+        self.move_left()
+    }
+
+    fn move_right(&mut self) {
+        self.move_right()
+    }
+
+    fn page_up(&mut self) {
+        self.page_up()
+    }
+
+    fn page_down(&mut self) {
+        self.page_down()
+    }
+
+    fn move_to_line_start(&mut self) {
+        self.move_to_line_start()
+    }
+
+    fn move_to_line_end(&mut self) {
+        self.move_to_line_end()
+    }
+
+    fn move_word_left(&mut self) {
+        self.move_word_left()
+    }
+
+    fn move_word_right(&mut self) {
+        self.move_word_right()
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.insert_char(c)
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        self.insert_str(s)
+    }
+
+    fn insert_newline(&mut self) {
+        self.insert_newline()
+    }
+
+    fn delete_char(&mut self) {
+        self.delete_char()
+    }
+
+    fn delete_char_at_cursor(&mut self) {
+        self.delete_char_at_cursor()
+    }
+
+    fn delete_selection(&mut self) {
+        self.delete_selection()
+    }
+
+    fn clear_current_line(&mut self) {
+        self.clear_current_line()
+    }
+
+    fn toggle_indent(&mut self) {
+        self.toggle_indent()
+    }
+
+    fn copy_to_clipboard(&self) {
+        self.copy_to_clipboard()
+    }
+
+    fn cut_to_clipboard(&mut self) {
+        self.cut_to_clipboard()
+    }
+
+    fn paste_from_clipboard(&mut self) {
+        self.paste_from_clipboard()
+    }
+
+    fn search_substring<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            use futures_util::StreamExt;
+
+            let mut query = String::new();
+            let prompt_prefix = "Search: ";
+            let mut reader = crossterm::event::EventStream::new();
+            let mut stdout = io::stdout();
+
+            loop {
+                let _ = stdout.queue(cursor::MoveTo(0, self.screen_rows - 1));
+                let current_view = format!("{}{}", prompt_prefix, query);
+                let fill = " ".repeat(
+                    (self.screen_cols as usize).saturating_sub(current_view.len()),
+                );
+                let _ = stdout.queue(Print(format!(
+                    "\x1b[7m{}{}\x1b[m",
+                    current_view, fill
+                )));
+                let _ = stdout.flush();
+
+                if let Some(Ok(Event::Key(key))) = reader.next().await {
+                    match key.code {
+                        KeyCode::Enter => break,
+                        KeyCode::Esc => return,
+                        KeyCode::Backspace => {
+                            query.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            query.push(c);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if query.is_empty() {
+                return;
+            }
+
+            let query_chars: Vec<char> = query.chars().collect();
+            let start_y = self.cursor_y;
+
+            for i in 0..self.lines.len() {
+                let check_y = (start_y + i) % self.lines.len();
+                let line = &self.lines[check_y];
+
+                if let Some(pos) = line
+                    .windows(query_chars.len())
+                    .position(|w| w == query_chars)
+                {
+                    self.cursor_y = check_y;
+                    self.cursor_x = pos;
+                    return;
+                }
+            }
+        })
+    }
+
+    fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    fn quit(&mut self) {
+        self.quit()
+    }
+}
