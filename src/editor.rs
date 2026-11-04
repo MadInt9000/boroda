@@ -5,10 +5,8 @@ use crate::lsp_adapter::LspAdapter;
 use crate::tokens::{LspDiagnostic, RenderToken};
 use crate::traits::{FileOperations, TextInteractive};
 use std::fs::File;
-use std::future::Future;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
-use std::pin::Pin;
 
 /// Файловая половина редактора: путь и LSP-адаптер.
 pub struct FileContext {
@@ -45,7 +43,9 @@ impl Editor {
             base: BaseEditor::new(filename.clone(), color_palette),
             file: FileContext::new(filename),
         };
-        editor.file.reload_file(&mut editor.base);
+        if let Ok(lines) = editor.file.reload_file() {
+            editor.base.load_lines(lines);
+        }
         editor
     }
 
@@ -104,13 +104,20 @@ impl TextInteractive for Editor {
         self.base.update_semantic_tokens(tokens)
     }
 
-    fn set_diagnostics(
-        &mut self,
-        errors: usize,
-        warnings: usize,
-        diagnostics: Vec<LspDiagnostic>,
-    ) {
+    fn set_diagnostics(&mut self, errors: usize, warnings: usize, diagnostics: Vec<LspDiagnostic>) {
         self.base.set_diagnostics(errors, warnings, diagnostics)
+    }
+
+    fn diagnostics(&self) -> &[LspDiagnostic] {
+        self.base.diagnostics()
+    }
+
+    fn diagnostics_icon_at(&self, x: u16, y: u16) -> bool {
+        self.base.diagnostics_icon_at(x, y)
+    }
+
+    fn jump_to_diagnostic(&mut self, index: usize) {
+        self.base.jump_to_diagnostic(index)
     }
 
     fn cursor_x(&self) -> usize {
@@ -131,6 +138,10 @@ impl TextInteractive for Editor {
 
     fn set_cursor(&mut self, y: usize, x: usize) {
         self.base.set_cursor(y, x)
+    }
+
+    fn find_in_editor(&mut self, query: &str) {
+        self.base.find_in_editor(query)
     }
 
     fn has_selection(&self) -> bool {
@@ -233,8 +244,12 @@ impl TextInteractive for Editor {
         self.base.paste_from_clipboard()
     }
 
-    fn search_substring<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
-        self.base.search_substring()
+    fn undo(&mut self) {
+        self.base.undo()
+    }
+
+    fn redo(&mut self) {
+        self.base.redo()
     }
 
     fn should_quit(&self) -> bool {
@@ -251,31 +266,28 @@ impl FileOperations for FileContext {
         &self.filename
     }
 
-    fn save_file(&self, text: &dyn TextInteractive) -> io::Result<()> {
+    fn save_file(&self, lines: &[Vec<char>]) -> io::Result<()> {
         let mut file = File::create(&self.filename)?;
-        for line in text.lines() {
+        for line in lines {
             let s: String = line.iter().collect();
             writeln!(file, "{}", s)?;
         }
         Ok(())
     }
 
-    fn reload_file(&mut self, text: &mut dyn TextInteractive) {
+    fn reload_file(&self) -> io::Result<Vec<Vec<char>>> {
         let mut new_lines = Vec::new();
         let path = Path::new(&self.filename);
 
         if path.exists() {
-            if let Ok(file) = File::open(path) {
-                let reader = BufReader::new(file);
-                for line in reader.lines() {
-                    if let Ok(ln) = line {
-                        new_lines.push(ln.chars().collect());
-                    }
-                }
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                new_lines.push(line?.chars().collect());
             }
         }
 
-        text.load_lines(new_lines);
+        Ok(new_lines)
     }
 
     fn notify_saved(&self, lsp_pool: &[LspClient]) {
@@ -294,12 +306,12 @@ impl FileOperations for Editor {
         self.file.filename()
     }
 
-    fn save_file(&self, text: &dyn TextInteractive) -> io::Result<()> {
-        self.file.save_file(text)
+    fn save_file(&self, lines: &[Vec<char>]) -> io::Result<()> {
+        self.file.save_file(lines)
     }
 
-    fn reload_file(&mut self, text: &mut dyn TextInteractive) {
-        self.file.reload_file(text)
+    fn reload_file(&self) -> io::Result<Vec<Vec<char>>> {
+        self.file.reload_file()
     }
 
     fn notify_saved(&self, lsp_pool: &[LspClient]) {

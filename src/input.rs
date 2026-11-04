@@ -1,34 +1,87 @@
 use crate::lsp::LspClient;
-use crate::traits::{FileOperations, TextInteractive};
+use crate::traits::{FileOperations, ModalInteractive, TextInteractive};
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use std::io;
 
 pub struct InputDriver;
 
 impl InputDriver {
+    /// Обрабатывает ввод только для активного редактора.
+    ///
+    /// Выбор активного редактора и его переключение — ответственность
+    /// `IntermediateState`, поэтому сюда приходят конкретные экземпляры,
+    /// а не векторы редакторов.
     pub async fn handle_input(
-        text_editors: &mut Vec<&mut dyn TextInteractive>,
-        file_editors: &mut Vec<&mut dyn FileOperations>,
-        current_idx: &mut usize,
+        text_editor: &mut dyn TextInteractive,
+        file_editor: &mut dyn FileOperations,
         lsp_pool: &[LspClient],
         event: Event,
         stdout: &mut io::Stdout,
     ) -> io::Result<()> {
-        Self::process_event(text_editors, file_editors, current_idx, lsp_pool, event).await?;
+        Self::process_event(text_editor, file_editor, lsp_pool, event).await?;
 
         // Отображение — тоже часть интерактивного текстового слоя
-        let editor = &mut *text_editors[*current_idx];
-        editor.update_window_size()?;
-        editor.scroll();
-        editor.draw(stdout)?;
+        text_editor.update_window_size()?;
+        text_editor.scroll();
+        text_editor.draw(stdout)?;
 
         Ok(())
     }
 
+    /// Транслирует низкоуровневые клавиши/мышь в смысловые методы
+    /// `ModalInteractive` и перерисовывает модалку.
+    ///
+    /// Проверка результата (`take_result`) и его применение остаются
+    /// на стороне `IntermediateState`.
+    pub fn handle_modal_input(
+        modal: &mut dyn ModalInteractive,
+        event: Event,
+        stdout: &mut io::Stdout,
+    ) -> io::Result<()> {
+        match event {
+            Event::Key(key) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let KeyCode::Char(c) = key.code {
+                        modal.control_char(c);
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Left => modal.move_left(),
+                        KeyCode::Right => modal.move_right(),
+                        KeyCode::Up => modal.move_up(),
+                        KeyCode::Down => modal.move_down(),
+                        KeyCode::PageUp => modal.page_up(),
+                        KeyCode::PageDown => modal.page_down(),
+                        KeyCode::Home => modal.move_to_start(),
+                        KeyCode::End => modal.move_to_end(),
+                        KeyCode::Tab => modal.tab(),
+                        KeyCode::Char(c) => modal.character_input(c),
+                        KeyCode::Backspace => modal.delete_backward(),
+                        KeyCode::Delete => modal.delete_forward(),
+                        KeyCode::Enter => modal.submit(),
+                        KeyCode::Esc => modal.close_modal(),
+                        _ => {}
+                    }
+                }
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    modal.mouse_click(mouse.column, mouse.row)
+                }
+                MouseEventKind::Down(MouseButton::Right) => modal.close_modal(),
+                MouseEventKind::ScrollUp => modal.mouse_scroll(true),
+                MouseEventKind::ScrollDown => modal.mouse_scroll(false),
+                _ => {}
+            },
+            _ => {}
+        }
+
+        modal.draw(stdout)
+    }
+
     async fn process_event(
-        text_editors: &mut Vec<&mut dyn TextInteractive>,
-        file_editors: &mut Vec<&mut dyn FileOperations>,
-        current_idx: &mut usize,
+        text_editor: &mut dyn TextInteractive,
+        file_editor: &mut dyn FileOperations,
         lsp_pool: &[LspClient],
         event: Event,
     ) -> io::Result<()> {
@@ -43,165 +96,159 @@ impl InputDriver {
                     KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                 ) {
                     if has_shift {
-                        text_editors[*current_idx].begin_selection();
+                        text_editor.begin_selection();
                     } else {
-                        text_editors[*current_idx].clear_selection();
+                        text_editor.clear_selection();
                     }
                 }
 
                 // CTRL-комбинации
                 if has_control {
                     match key.code {
-                        KeyCode::PageUp => {
-                            Self::previous_editor(text_editors.len(), current_idx);
+                        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'z') => {
+                            if has_shift {
+                                text_editor.redo();
+                            } else {
+                                text_editor.undo();
+                            }
                             return Ok(());
                         }
-                        KeyCode::PageDown => {
-                            Self::next_editor(text_editors.len(), current_idx);
+                        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'y') => {
+                            text_editor.redo();
                             return Ok(());
                         }
                         KeyCode::Left => {
-                            text_editors[*current_idx].move_word_left();
+                            text_editor.move_word_left();
                             return Ok(());
                         }
                         KeyCode::Right => {
-                            text_editors[*current_idx].move_word_right();
+                            text_editor.move_word_right();
                             return Ok(());
                         }
                         KeyCode::Insert => {
-                            text_editors[*current_idx].paste_from_clipboard();
+                            text_editor.paste_from_clipboard();
                             return Ok(());
                         }
                         _ => {}
                     }
                 }
 
-                // Файловые операции отправляются во второй вектор
+                // Файловые операции
                 match key.code {
                     KeyCode::F(2) => {
-                        Self::save(text_editors, file_editors, *current_idx, lsp_pool)?;
+                        Self::save(text_editor, file_editor, lsp_pool)?;
                         return Ok(());
                     }
                     KeyCode::F(4) => {
-                        let line = text_editors[*current_idx].cursor_y();
-                        let col = text_editors[*current_idx].cursor_x();
-                        if let Some(lsp) = file_editors[*current_idx].lsp_adapter() {
+                        let line = text_editor.cursor_y();
+                        let col = text_editor.cursor_x();
+                        if let Some(lsp) = file_editor.lsp_adapter() {
                             lsp.request_definition(lsp_pool, line, col);
                         }
                         return Ok(());
                     }
                     KeyCode::F(11) => {
-                        Self::save(text_editors, file_editors, *current_idx, lsp_pool)?;
-                        text_editors[*current_idx].quit();
+                        Self::save(text_editor, file_editor, lsp_pool)?;
+                        text_editor.quit();
                         return Ok(());
                     }
                     KeyCode::F(12) => {
-                        let text = &mut *text_editors[*current_idx];
-                        let file = &mut *file_editors[*current_idx];
-                        file.reload_file(text);
+                        let lines = file_editor.reload_file()?;
+                        text_editor.load_lines(lines);
                         return Ok(());
                     }
                     _ => {}
                 }
 
                 // Текстовые операции и навигация
-                let editor = &mut *text_editors[*current_idx];
                 match key.code {
-                    KeyCode::F(1) => editor.toggle_indent(),
-                    KeyCode::F(3) => editor.search_substring().await,
-                    KeyCode::F(5) => editor.copy_to_clipboard(),
-                    KeyCode::F(6) => editor.paste_from_clipboard(),
-                    KeyCode::F(7) => editor.clear_current_line(),
-                    KeyCode::F(8) => editor.cut_to_clipboard(),
-                    KeyCode::F(9) => editor.move_to_line_start(),
-                    KeyCode::F(10) => editor.quit(),
+                    KeyCode::F(1) => text_editor.toggle_indent(),
+                    KeyCode::F(5) => text_editor.copy_to_clipboard(),
+                    KeyCode::F(6) => text_editor.paste_from_clipboard(),
+                    KeyCode::F(7) => text_editor.clear_current_line(),
+                    KeyCode::F(8) => text_editor.cut_to_clipboard(),
+                    KeyCode::F(9) => text_editor.move_to_line_start(),
 
-                    KeyCode::PageUp => editor.page_up(),
-                    KeyCode::PageDown => editor.page_down(),
-                    KeyCode::Home => editor.move_to_line_start(),
-                    KeyCode::End => editor.move_to_line_end(),
-                    KeyCode::Up => editor.move_up(),
-                    KeyCode::Down => editor.move_down(),
-                    KeyCode::Left => editor.move_left(),
-                    KeyCode::Right => editor.move_right(),
+                    KeyCode::PageUp => text_editor.page_up(),
+                    KeyCode::PageDown => text_editor.page_down(),
+                    KeyCode::Home => text_editor.move_to_line_start(),
+                    KeyCode::End => text_editor.move_to_line_end(),
+                    KeyCode::Up => text_editor.move_up(),
+                    KeyCode::Down => text_editor.move_down(),
+                    KeyCode::Left => text_editor.move_left(),
+                    KeyCode::Right => text_editor.move_right(),
 
                     KeyCode::Delete => {
-                        if editor.has_selection() {
-                            editor.delete_selection();
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
                         } else {
-                            editor.delete_char_at_cursor();
+                            text_editor.delete_char_at_cursor();
                         }
                     }
+                    KeyCode::Tab if has_control => {}
                     KeyCode::Tab => {
-                        if editor.has_selection() {
-                            editor.delete_selection();
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
                         }
-                        editor.insert_str("    ");
+                        text_editor.insert_str("    ");
                     }
                     KeyCode::Char(c) => {
-                        if editor.has_selection() {
-                            editor.delete_selection();
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
                         }
-                        editor.insert_char(c);
+                        text_editor.insert_char(c);
                     }
                     KeyCode::Backspace => {
-                        if editor.has_selection() {
-                            editor.delete_selection();
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
                         } else {
-                            editor.delete_char();
+                            text_editor.delete_char();
                         }
                     }
                     KeyCode::Enter => {
-                        if editor.has_selection() {
-                            editor.delete_selection();
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
                         }
-                        editor.insert_newline();
+                        text_editor.insert_newline();
                     }
                     _ => {}
                 }
             }
 
             Event::Mouse(mouse_event) => {
-                let has_shift = mouse_event.modifiers.contains(KeyModifiers::SHIFT);
+                //let has_shift = mouse_event.modifiers.contains(KeyModifiers::SHIFT);
                 let has_control = mouse_event.modifiers.contains(KeyModifiers::CONTROL);
 
                 match mouse_event.kind {
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        text_editor.click_mouse(mouse_event.column, mouse_event.row);
+                        if !text_editor.has_selection() { text_editor.begin_selection(); }
+                    }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if has_shift {
-                            text_editors[*current_idx].begin_selection();
-                        } else {
-                            text_editors[*current_idx].clear_selection();
-                        }
-                        text_editors[*current_idx]
-                            .click_mouse(mouse_event.column, mouse_event.row);
+                        text_editor.clear_selection();
+                        text_editor.click_mouse(mouse_event.column, mouse_event.row);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if mouse_event.row == 0 {
-                            Self::previous_editor(text_editors.len(), current_idx);
-                        } else if has_control {
-                            let line = text_editors[*current_idx].row_offset()
-                                + mouse_event.row as usize
-                                - 1;
-                            let col = text_editors[*current_idx].col_offset()
-                                + mouse_event.column as usize;
+                        if has_control {
+                            let line = text_editor.row_offset() + mouse_event.row as usize - 1;
+                            let col = text_editor.col_offset() + mouse_event.column as usize;
 
-                            if let Some(lsp) = file_editors[*current_idx].lsp_adapter() {
+                            if let Some(lsp) = file_editor.lsp_adapter() {
                                 lsp.request_definition(lsp_pool, line, col);
                             }
                         }
                     }
-                    MouseEventKind::Up(MouseButton::Right) => {
-                        if mouse_event.row == 0 {
-                            Self::next_editor(text_editors.len(), current_idx);
-                        }
-                    }
                     MouseEventKind::ScrollUp => {
-                        text_editors[*current_idx].clear_selection();
-                        text_editors[*current_idx].move_up();
+                        text_editor.clear_selection();
+                        text_editor.move_up();
+                        text_editor.move_up();
+                        text_editor.move_up();
                     }
                     MouseEventKind::ScrollDown => {
-                        text_editors[*current_idx].clear_selection();
-                        text_editors[*current_idx].move_down();
+                        text_editor.clear_selection();
+                        text_editor.move_down();
+                        text_editor.move_down();
+                        text_editor.move_down();
                     }
                     _ => {}
                 }
@@ -213,30 +260,13 @@ impl InputDriver {
     }
 
     fn save(
-        text_editors: &mut [&mut dyn TextInteractive],
-        file_editors: &mut [&mut dyn FileOperations],
-        idx: usize,
+        text_editor: &dyn TextInteractive,
+        file_editor: &dyn FileOperations,
         lsp_pool: &[LspClient],
     ) -> io::Result<()> {
-        let text: &dyn TextInteractive = &*text_editors[idx];
-        file_editors[idx].save_file(text)?;
-        file_editors[idx].notify_saved(lsp_pool);
+        let lines = text_editor.lines();
+        file_editor.save_file(lines)?;
+        file_editor.notify_saved(lsp_pool);
         Ok(())
-    }
-
-    fn next_editor(len: usize, current_idx: &mut usize) {
-        if len > 0 {
-            *current_idx = (*current_idx + 1) % len;
-        }
-    }
-
-    fn previous_editor(len: usize, current_idx: &mut usize) {
-        if len > 0 {
-            *current_idx = if *current_idx == 0 {
-                len - 1
-            } else {
-                *current_idx - 1
-            };
-        }
     }
 }

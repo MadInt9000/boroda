@@ -9,15 +9,17 @@ impl ConfigTokenizer {
         let mut file_tokens = vec![Vec::new(); lines.len()];
 
         // 1. Компилируем регулярные выражения
-        let comment_ini_toml = Regex::new(r"[#;].*").unwrap(); 
-        let string_double = Regex::new(r#""[^"\\]*(?:\\.[^"\\]*)*""#).unwrap(); 
-        let string_single = Regex::new(r#"'[^'\\]*(?:\\.[^'\\]*)*'"#).unwrap(); 
-        
+        let comment_ini_toml = Regex::new(r"[#;].*").unwrap();
+        let string_double = Regex::new(r#""[^"\\]*(?:\\.[^"\\]*)*""#).unwrap();
+        let string_single = Regex::new(r#"'[^'\\]*(?:\\.[^'\\]*)*'"#).unwrap();
+
         let section_regex = Regex::new(r"^[ \t]*\[+[^\]]+\]+").unwrap();
-        
+
         // ИСПРАВЛЕНО: Захватываем ключ в группу 1, а разделитель (:=) со сопутствующими пробелами включаем в общий поиск
-        let key_regex = Regex::new(r#"(?:^[ \t]*|[ \t,]+)((?:"[^"]+"?|'[^']+'?|[a-zA-Z0-9_\-\.]+))\s*[:=]"#).unwrap();
-        
+        let key_regex =
+            Regex::new(r#"(?:^[ \t]*|[ \t,]+)((?:"[^"]+"?|'[^']+'?|[a-zA-Z0-9_\-\.]+))\s*[:=]"#)
+                .unwrap();
+
         let number_regex = Regex::new(r"\b\-?\d+(?:\.\d+)?\b").unwrap();
         let literal_regex = Regex::new(r"\b(true|false|null|inf|nan)\b").unwrap();
 
@@ -40,7 +42,7 @@ impl ConfigTokenizer {
             };
 
             // 3. Применяем регулярные выражения от низкого приоритета к высокому
-            
+
             // Числа (1 = Бирюзовый)
             for mat in number_regex.find_iter(&line_str) {
                 fill_mask(mat.start(), mat.end(), 1);
@@ -104,4 +106,3 @@ impl ConfigTokenizer {
         file_tokens
     }
 }
-

@@ -1,17 +1,17 @@
-use crate::lsp::LspClient;
-use crate::tokens::{LspDiagnostic, RenderToken};
-use crate::python_tokenizer::PythonTokenizer;
 use crate::loader::ProjectLoader;
+use crate::lsp::LspClient;
+use crate::python_tokenizer::PythonTokenizer;
+use crate::tokens::{LspDiagnostic, RenderToken};
 use lsp_types::Url;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 pub struct LspAdapter {
     pub version_counter: Arc<AtomicI64>,
     pub abs_filename_str: String,
-    pub last_tokens_request_id: AtomicI64, 
+    pub last_tokens_request_id: AtomicI64,
     pub pending_definition_request_id: AtomicI64,
 }
 
@@ -21,7 +21,7 @@ pub enum LspParseResult {
         errors: usize,
         warnings: usize,
         diagnostics: Vec<LspDiagnostic>,
-    },    
+    },
     // НОВОЕ: Передает путь к файлу, целевую строку и колонку
     Definition {
         abs_path: String,
@@ -48,15 +48,17 @@ impl LspAdapter {
     /// Уведомляет сервер об открытии текстового документа
     pub fn did_open(&self, lsp_pool: &[LspClient], text: &str) {
         if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
-            if !client.is_started() { return; }
+            if !client.is_started() {
+                return;
+            }
 
             let path = Path::new(&self.abs_filename_str);
-            if !path.exists() { 
+            if !path.exists() {
                 return;
             }
             let file_url = Url::from_file_path(path).unwrap();
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            
+
             let language_id = match ext {
                 "py" => "python",
                 "php" => "php",
@@ -85,7 +87,9 @@ impl LspAdapter {
     /// Отправляет на сервер измененное содержимое документа (Full Sync)
     pub fn send_change_notification(&self, lsp_pool: &[LspClient], text_content: &str) {
         if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
-            if !client.is_started() { return; }
+            if !client.is_started() {
+                return;
+            }
 
             let file_url = Url::from_file_path(Path::new(&self.abs_filename_str)).unwrap();
             let current_version = self.version_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -110,12 +114,15 @@ impl LspAdapter {
     /// Отправляет текстовый запрос textDocument/definition на сервер
     pub fn request_definition(&self, lsp_pool: &[LspClient], line: usize, col: usize) {
         if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
-            if !client.is_started() { return; }
+            if !client.is_started() {
+                return;
+            }
 
             let next_id = Self::next_global_id();
-            
+
             // НОВОЕ: Сразу сохраняем сгенерированный ID внутри адаптера
-            self.pending_definition_request_id.store(next_id, Ordering::SeqCst);
+            self.pending_definition_request_id
+                .store(next_id, Ordering::SeqCst);
 
             let file_url = Url::from_file_path(Path::new(&self.abs_filename_str)).unwrap();
 
@@ -138,7 +145,11 @@ impl LspAdapter {
     }
 
     /// Запрашивает токены, самостоятельно определяя нужный LspClient по пулу
-    pub fn request_syntax_tokens(&self, lsp_pool: &[LspClient], lines: &[Vec<char>]) -> Option<LspParseResult> {
+    pub fn request_syntax_tokens(
+        &self,
+        lsp_pool: &[LspClient],
+        lines: &[Vec<char>],
+    ) -> Option<LspParseResult> {
         let ext = Path::new(&self.abs_filename_str)
             .extension()
             .and_then(|s| s.to_str())
@@ -147,11 +158,13 @@ impl LspAdapter {
         if ext == "py" {
             let local_tokens = PythonTokenizer::tokenize_text(lines);
             Some(LspParseResult::Tokens(local_tokens))
-        } else if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
+        } else if let Some(client) =
+            ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool)
+        {
             if client.is_started() {
                 let next_id = Self::next_global_id();
                 self.last_tokens_request_id.store(next_id, Ordering::SeqCst);
-                
+
                 client.request_semantic_tokens_with_id(&self.abs_filename_str, next_id);
             }
             None
@@ -163,7 +176,9 @@ impl LspAdapter {
     /// Отправляет серверу уведомление о физическом сохранении файла на диск
     pub fn send_save_notification(&self, lsp_pool: &[LspClient]) {
         if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
-            if !client.is_started() { return; }
+            if !client.is_started() {
+                return;
+            }
 
             let file_url = Url::from_file_path(Path::new(&self.abs_filename_str)).unwrap();
 
@@ -184,24 +199,25 @@ impl LspAdapter {
 
     /// Разбирает входящие сообщения JSON-RPC от пула серверов
     pub fn parse_lsp_message(
-        &self, 
-        lsp_pool: &[LspClient], 
-        lsp_msg: &Value, 
-        text_content: &str, 
-        total_lines: usize   
+        &self,
+        lsp_pool: &[LspClient],
+        lsp_msg: &Value,
+        text_content: &str,
+        total_lines: usize,
     ) -> Option<LspParseResult> {
-        
         if let Some(id) = lsp_msg.get("id").and_then(|id| id.as_i64()) {
             // id == 1: Фоновый хендшейк инициализации
             if id == 1 {
-                if let Some(client) = ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool) {
+                if let Some(client) =
+                    ProjectLoader::get_server_client(&self.abs_filename_str, lsp_pool)
+                {
                     if client.is_started() {
                         client.send_initialized();
                         self.did_open(lsp_pool, text_content);
-                        
+
                         let next_id = Self::next_global_id();
                         self.last_tokens_request_id.store(next_id, Ordering::SeqCst);
-                        
+
                         client.request_semantic_tokens_with_id(&self.abs_filename_str, next_id);
                     }
                 }
@@ -211,7 +227,8 @@ impl LspAdapter {
             let expected_def_id = self.pending_definition_request_id.load(Ordering::SeqCst);
             if expected_def_id != 0 && id == expected_def_id {
                 // Сбрасываем ID запроса, так как ответ получен
-                self.pending_definition_request_id.store(0, Ordering::SeqCst);
+                self.pending_definition_request_id
+                    .store(0, Ordering::SeqCst);
 
                 if let Some(result) = lsp_msg.get("result") {
                     let location = if result.is_array() {
@@ -223,7 +240,9 @@ impl LspAdapter {
                     };
 
                     if let Some(loc) = location {
-                        if let (Some(uri_str), Some(range)) = (loc.get("uri").and_then(|u| u.as_str()), loc.get("range")) {
+                        if let (Some(uri_str), Some(range)) =
+                            (loc.get("uri").and_then(|u| u.as_str()), loc.get("range"))
+                        {
                             if let Ok(url) = Url::parse(uri_str) {
                                 if let Ok(path) = url.to_file_path() {
                                     let abs_path = path.to_string_lossy().into_owned();
@@ -231,7 +250,11 @@ impl LspAdapter {
                                     let line = Self::extract_pos(start, "line");
                                     let col = Self::extract_pos(start, "character");
 
-                                    return Some(LspParseResult::Definition { abs_path, line, col });
+                                    return Some(LspParseResult::Definition {
+                                        abs_path,
+                                        line,
+                                        col,
+                                    });
                                 }
                             }
                         }
@@ -255,7 +278,7 @@ impl LspAdapter {
 
                             if delta_line > 0 {
                                 current_line += delta_line;
-                                current_char = delta_start; 
+                                current_char = delta_start;
                             } else {
                                 current_char += delta_start;
                             }
@@ -272,17 +295,18 @@ impl LspAdapter {
                     }
                 }
             }
-        }    
-            
+        }
+
         // Обработка push-диагностики (publishDiagnostics)
-        if lsp_msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
+        if lsp_msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+        {
             if let Some(params) = lsp_msg.get("params") {
                 if let (Some(uri_str), Ok(current_url)) = (
                     params.get("uri").and_then(|u| u.as_str()),
-                    Url::from_file_path(Path::new(&self.abs_filename_str))
+                    Url::from_file_path(Path::new(&self.abs_filename_str)),
                 ) {
-                    if uri_str != current_url.as_str() { 
-                        return None; 
+                    if uri_str != current_url.as_str() {
+                        return None;
                     }
                 }
 
@@ -290,32 +314,44 @@ impl LspAdapter {
                 let mut warnings = 0;
                 let mut diagnostics = Vec::new();
 
-                if let Some(diagnostics_array) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                if let Some(diagnostics_array) =
+                    params.get("diagnostics").and_then(|d| d.as_array())
+                {
                     for diag in diagnostics_array {
                         let severity = diag.get("severity").and_then(|s| s.as_i64()).unwrap_or(1);
-                        if severity == 1 { errors += 1; } 
-                        else if severity == 2 { warnings += 1; }
+                        if severity == 1 {
+                            errors += 1;
+                        } else if severity == 2 {
+                            warnings += 1;
+                        }
 
                         if let Some(range) = diag.get("range") {
                             diagnostics.push(LspDiagnostic {
                                 start_line: Self::extract_pos(range.get("start"), "line"),
                                 start_col: Self::extract_pos(range.get("start"), "character"),
                                 end_line: Self::extract_pos(range.get("end"), "line"),
-                                end_col:  Self::extract_pos(range.get("end"), "character"),
-                                message: diag.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+                                end_col: Self::extract_pos(range.get("end"), "character"),
+                                severity: severity.clamp(0, u8::MAX as i64) as u8,
+                                message: diag
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
                             });
                         }
                     }
                 }
-            return Some(LspParseResult::Diagnostics { errors, warnings, diagnostics });
+                return Some(LspParseResult::Diagnostics {
+                    errors,
+                    warnings,
+                    diagnostics,
+                });
             }
         }
-    None
+        None
     }
-    
+
     fn extract_pos(pos_obj: Option<&Value>, key: &str) -> usize {
-        pos_obj
-            .and_then(|p| p[key].as_u64())
-            .unwrap_or(0) as usize
+        pos_obj.and_then(|p| p[key].as_u64()).unwrap_or(0) as usize
     }
 }

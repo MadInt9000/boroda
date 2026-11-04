@@ -10,9 +10,19 @@ pub struct LspServerConfig {
     pub args: Vec<String>,
 }
 
+fn default_autoload_extra() -> Vec<String> {
+    ["md", "ini", "conf", "txt"]
+        .iter()
+        .map(|ext| ext.to_string())
+        .collect()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Configuration {
     pub file_types: HashMap<String, String>,
+    /// Расширения, которые открываются автоматически даже без LSP-сервера.
+    #[serde(default = "default_autoload_extra")]
+    pub autoload_extra: Vec<String>,
     pub lsp_servers: HashMap<String, LspServerConfig>,
     pub color_palettes: HashMap<String, HashMap<String, String>>,
     pub default_palette: HashMap<String, String>,
@@ -28,31 +38,40 @@ impl Default for Configuration {
         let mut lsp_servers = HashMap::new();
         lsp_servers.insert(
             "python".to_string(),
-            LspServerConfig { command: "pyright-langserver".to_string(), args: vec!["--stdio".to_string()] },
+            LspServerConfig {
+                command: "pyright-langserver".to_string(),
+                args: vec!["--stdio".to_string()],
+            },
         );
         lsp_servers.insert(
             "rust".to_string(),
-            LspServerConfig { command: "rust-analyzer".to_string(), args: vec![] },
+            LspServerConfig {
+                command: "rust-analyzer".to_string(),
+                args: vec![],
+            },
         );
         lsp_servers.insert(
             "php".to_string(),
-            LspServerConfig { command: "intelephense".to_string(), args: vec!["--stdio".to_string()] },
+            LspServerConfig {
+                command: "intelephense".to_string(),
+                args: vec!["--stdio".to_string()],
+            },
         );
 
         let mut default_palette = HashMap::new();
-        default_palette.insert("0".to_string(), "\x1b[90m".to_string());    // Комментарии
-        default_palette.insert("1".to_string(), "\x1b[0;36m".to_string());   // Ключевые слова / Числа
-        default_palette.insert("2".to_string(), "\x1b[0;32m".to_string());   // Структуры
-        default_palette.insert("3".to_string(), "\x1b[3;32m".to_string());   // Литералы
-        default_palette.insert("4".to_string(), "\x1b[0;92m".to_string());   // Конструкторы
-        default_palette.insert("5".to_string(), "\x1b[0;95m".to_string());   // Трейты
-        default_palette.insert("6".to_string(), "\x1b[0;96m".to_string());   // Операторы
-        default_palette.insert("7".to_string(), "\x1b[1;34m".to_string());   // Макросы
-        default_palette.insert("8".to_string(), "\x1b[0;93m".to_string());   // Вызовы методов
-        default_palette.insert("9".to_string(), "\x1b[4;32m".to_string());   // Импорты
+        default_palette.insert("0".to_string(), "\x1b[90m".to_string()); // Комментарии
+        default_palette.insert("1".to_string(), "\x1b[0;36m".to_string()); // Ключевые слова / Числа
+        default_palette.insert("2".to_string(), "\x1b[0;32m".to_string()); // Структуры
+        default_palette.insert("3".to_string(), "\x1b[3;32m".to_string()); // Литералы
+        default_palette.insert("4".to_string(), "\x1b[0;92m".to_string()); // Конструкторы
+        default_palette.insert("5".to_string(), "\x1b[0;95m".to_string()); // Трейты
+        default_palette.insert("6".to_string(), "\x1b[0;96m".to_string()); // Операторы
+        default_palette.insert("7".to_string(), "\x1b[1;34m".to_string()); // Макросы
+        default_palette.insert("8".to_string(), "\x1b[0;93m".to_string()); // Вызовы методов
+        default_palette.insert("9".to_string(), "\x1b[4;32m".to_string()); // Импорты
         default_palette.insert("10".to_string(), "\x1b[0;36m".to_string());
-        default_palette.insert("13".to_string(), "\x1b[3m".to_string());     // Свойства
-        default_palette.insert("14".to_string(), "\x1b[0;33m".to_string());    // Строки
+        default_palette.insert("13".to_string(), "\x1b[3m".to_string()); // Свойства
+        default_palette.insert("14".to_string(), "\x1b[0;33m".to_string()); // Строки
         default_palette.insert("15".to_string(), "\x1b[0;32m".to_string());
         default_palette.insert("default".to_string(), "\x1b[0m".to_string());
 
@@ -62,7 +81,13 @@ impl Default for Configuration {
         let mut color_palettes = HashMap::new();
         color_palettes.insert("py".to_string(), python_palette);
 
-        Self { file_types, lsp_servers, color_palettes, default_palette }
+        Self {
+            file_types,
+            autoload_extra: default_autoload_extra(),
+            lsp_servers,
+            color_palettes,
+            default_palette,
+        }
     }
 }
 
@@ -111,11 +136,18 @@ impl Configuration {
     /// НОВОЕ: Преобразует текстовую карту цветов из JSON в плоский быстрый вектор.
     /// Размер вектора по умолчанию берем 32 (хватит для большинства стандартных токенов LSP).
     pub fn compile_palette_to_vector(&self, ext: &str) -> Vec<String> {
-        let default_reset = self.default_palette.get("default").cloned().unwrap_or_else(|| "\x1b[0m".to_string());
+        let default_reset = self
+            .default_palette
+            .get("default")
+            .cloned()
+            .unwrap_or_else(|| "\x1b[0m".to_string());
         let mut vec_palette = vec![default_reset.clone(); 32];
 
         // Определяем, какую сырую палитру взять
-        let raw_palette = self.color_palettes.get(ext).unwrap_or(&self.default_palette);
+        let raw_palette = self
+            .color_palettes
+            .get(ext)
+            .unwrap_or(&self.default_palette);
 
         // Заполняем вектор значениями
         for (key, color) in raw_palette {
@@ -131,4 +163,3 @@ impl Configuration {
         vec_palette
     }
 }
-

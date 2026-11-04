@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use arboard::Clipboard as SystemClipboard;
+use std::sync::Mutex;
 
 pub struct ClipboardManager {
     // Используем Mutex для потокобезопасного глобального доступа
@@ -9,9 +9,7 @@ pub struct ClipboardManager {
 
 impl ClipboardManager {
     fn new() -> Self {
-        let sys_clip = SystemClipboard::new()
-            .map(Mutex::new)
-            .ok(); // Если ОС не поддерживает или нет оконного менеджера, будет None
+        let sys_clip = SystemClipboard::new().map(Mutex::new).ok(); // Если ОС не поддерживает или нет оконного менеджера, будет None
 
         Self {
             system_clipboard: sys_clip,

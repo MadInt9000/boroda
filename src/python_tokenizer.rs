@@ -10,11 +10,12 @@ impl PythonTokenizer {
 
         // 1. Компилируем регулярные выражения
         let comment_regex = Regex::new(r"#.*").unwrap();
+        let whitespace_regex = Regex::new(r"\s+").unwrap();
         let string_double = Regex::new(r#""[^"\\]*(?:\\.[^"\\]*)*""#).unwrap();
         let string_single = Regex::new(r#"'[^'\\]*(?:\\.[^'\\]*)*'"#).unwrap();
-        
+
         let keywords_regex = Regex::new(
-            r"\b(def|class|return|if|elif|else|import|from|as|for|in|while|try|except|finally|with|assert|pass|break|continue|lambda|None|True|False|and|or|not|is|global|nonlocal)\b"
+            r"\b(def|async|class|return|if|elif|else|import|from|as|for|in|while|try|except|finally|with|assert|pass|break|continue|lambda|None|True|False|and|or|not|is|global|nonlocal)\b"
         ).unwrap();
 
         let class_name_regex = Regex::new(r"\b[A-Z][a-zA-Z0-9_]*\b").unwrap();
@@ -36,8 +37,8 @@ impl PythonTokenizer {
                     token_type: 14,
                 });
                 file_tokens[row_idx] = tokens;
-                if doc_count == 1 { 
-                    in_multiline = !in_multiline; 
+                if doc_count == 1 {
+                    in_multiline = !in_multiline;
                 }
                 continue;
             }
@@ -67,7 +68,12 @@ impl PythonTokenizer {
             };
 
             // 4. Применяем регулярные выражения с использованием замыкания
-            
+
+            // Пробелы
+            for mat in whitespace_regex.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 0);
+            }
+
             // Числа (1 = Бирюзовый)
             for mat in number_regex.find_iter(&line_str) {
                 fill_mask(mat.start(), mat.end(), 1);
@@ -90,6 +96,11 @@ impl PythonTokenizer {
                 fill_mask(mat.start(), mat.end(), 6);
             }
 
+            // Комментарии (0 = Серый)
+            for mat in comment_regex.find_iter(&line_str) {
+                fill_mask(mat.start(), mat.end(), 0);
+            }
+
             // Строки "" (5 = Желтый)
             for mat in string_double.find_iter(&line_str) {
                 fill_mask(mat.start(), mat.end(), 14);
@@ -98,11 +109,6 @@ impl PythonTokenizer {
             // Строки '' (5 = Желтый)
             for mat in string_single.find_iter(&line_str) {
                 fill_mask(mat.start(), mat.end(), 14);
-            }
-
-            // Комментарии (0 = Серый)
-            for mat in comment_regex.find_iter(&line_str) {
-                fill_mask(mat.start(), mat.end(), 0);
             }
 
             // 5. Сборка токенов из маски стилей
@@ -131,4 +137,3 @@ impl PythonTokenizer {
         file_tokens
     }
 }
-

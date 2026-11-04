@@ -1,17 +1,10 @@
 use crate::clipboard::ClipboardManager;
+use crate::history::{History, Operation};
 use crate::tokens::{LspDiagnostic, RenderToken, Selection};
 use crate::traits::TextInteractive;
-use crossterm::{
-    cursor,
-    event::{Event, KeyCode},
-    style::Print,
-    terminal,
-    QueueableCommand,
-};
+use crossterm::{cursor, style::Print, terminal, QueueableCommand};
 use std::cmp;
-use std::future::Future;
 use std::io::{self, Write};
-use std::pin::Pin;
 
 pub struct BaseEditor {
     pub filename: String,
@@ -31,6 +24,7 @@ pub struct BaseEditor {
     // Каждому элементу lines соответствует свой вектор токенов
     pub semantic_tokens: Vec<Vec<RenderToken>>,
     pub color_palette: Vec<String>,
+    pub history: History,
 }
 
 impl BaseEditor {
@@ -52,6 +46,34 @@ impl BaseEditor {
             diagnostics: Vec::new(),
             semantic_tokens: vec![Vec::new()],
             color_palette,
+            history: History::new(),
+        }
+    }
+
+    fn line_string(&self, row: usize) -> String {
+        self.lines
+            .get(row)
+            .map(|line| line.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Синхронизирует служебное состояние после undo/redo.
+    fn sync_after_history(&mut self) {
+        self.semantic_tokens = vec![Vec::new(); self.lines.len()];
+        self.selection = None;
+        self.cursor_y = self.cursor_y.min(self.lines.len().saturating_sub(1));
+        self.cursor_x = self.cursor_x.min(self.lines[self.cursor_y].len());
+    }
+
+    pub fn undo(&mut self) {
+        if self.history.undo(&mut self.lines, &mut self.cursor_y) {
+            self.sync_after_history();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if self.history.redo(&mut self.lines, &mut self.cursor_y) {
+            self.sync_after_history();
         }
     }
 
@@ -66,6 +88,7 @@ impl BaseEditor {
     }
 
     pub fn load_lines(&mut self, new_lines: Vec<Vec<char>>) {
+        self.history.clear();
         self.lines = if new_lines.is_empty() {
             vec![Vec::new()]
         } else {
@@ -102,6 +125,59 @@ impl BaseEditor {
         self.error_count = errors;
         self.warning_count = warnings;
         self.diagnostics = diagnostics;
+    }
+
+    fn header_left(&self) -> String {
+        format!(
+            " {} | Lines: {} | Pos: {},{} | ",
+            self.title(),
+            self.lines.len(),
+            self.cursor_y + 1,
+            self.cursor_x + 1
+        )
+    }
+
+    fn header_icons(&self) -> String {
+        let mut icons = String::new();
+        for _ in 0..self.error_count {
+            icons.push_str("🛑");
+        }
+        for _ in 0..self.warning_count {
+            icons.push_str("⚠️ ");
+        }
+        icons
+    }
+
+    fn diagnostics_icon_width(&self) -> usize {
+        if self.error_count == 0 && self.warning_count == 0 {
+            0
+        } else {
+            self.error_count * 2 + self.warning_count * 2 + 1
+        }
+    }
+
+    /// Попал ли клик в значки ошибок/предупреждений в строке заголовка.
+    pub fn diagnostics_icon_at(&self, x: u16, y: u16) -> bool {
+        if y != 0 {
+            return false;
+        }
+
+        let width = self.diagnostics_icon_width();
+        if width == 0 {
+            return false;
+        }
+
+        let start = self.header_left().chars().count() as u16;
+        let end = start.saturating_add(width as u16);
+        x >= start && x < end
+    }
+
+    /// Перемещает курсор на диагностику с указанным индексом.
+    pub fn jump_to_diagnostic(&mut self, index: usize) {
+        if let Some(diagnostic) = self.diagnostics.get(index) {
+            let (line, col) = (diagnostic.start_line, diagnostic.start_col);
+            self.set_cursor(line, col);
+        }
     }
 
     pub fn scroll(&mut self) {
@@ -153,7 +229,8 @@ impl BaseEditor {
             let (p1_y, p1_x) = (sel.start_y, sel.start_x);
             let (p2_y, p2_x) = (self.cursor_y, self.cursor_x);
 
-            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x) {
+            let (start_y, start_x, end_y, end_x) = if p1_y < p2_y || (p1_y == p2_y && p1_x <= p2_x)
+            {
                 (p1_y, p1_x, p2_y, p2_x)
             } else {
                 (p2_y, p2_x, p1_y, p1_x)
@@ -228,9 +305,7 @@ impl BaseEditor {
                     }
                     if token_idx < tokens.len() {
                         let token = &tokens[token_idx];
-                        if file_col >= token.start_col
-                            && file_col < token.start_col + token.len
-                        {
+                        if file_col >= token.start_col && file_col < token.start_col + token.len {
                             color = self.get_token_color(token.token_type);
                         }
                     }
@@ -252,25 +327,9 @@ impl BaseEditor {
         // 1. Статус-бар
         stdout.queue(cursor::MoveTo(0, 0))?;
 
-        let status_left = format!(
-            " {} | Lines: {} | Pos: {},{} | ",
-            self.title(),
-            self.lines.len(),
-            self.cursor_y + 1,
-            self.cursor_x + 1
-        );
-
-        let mut status_right = String::new();
-        for _ in 0..self.error_count {
-            status_right.push_str("🛑");
-        }
-        for _ in 0..self.warning_count {
-            status_right.push_str("⚠️ ")
-        }
-
-        let right_visual_len = (self.error_count * 2)
-            + (self.warning_count * 2)
-            + if status_right.is_empty() { 0 } else { 1 };
+        let status_left = self.header_left();
+        let status_right = self.header_icons();
+        let right_visual_len = self.diagnostics_icon_width();
         let total_used = status_left.len() + right_visual_len;
 
         let fill_len = (self.screen_cols as usize).saturating_sub(total_used);
@@ -297,8 +356,7 @@ impl BaseEditor {
             if file_row < self.lines.len() {
                 let line = &self.lines[file_row];
                 if line.len() > self.col_offset {
-                    let render_len =
-                        (line.len() - self.col_offset).min(self.screen_cols as usize);
+                    let render_len = (line.len() - self.col_offset).min(self.screen_cols as usize);
                     self.draw_line_with_lsp_syntax(file_row, render_len, stdout)?;
                 }
                 stdout.queue(Print("\x1b[K"))?;
@@ -322,9 +380,18 @@ impl BaseEditor {
             // каждому хинту достается screen_cols / 12 знакомест,
             // недостающие пробелы добавляем справа.
             let hints = [
-                "F1 TogIdt", "F2 Save", "F3 Search", "F4 GoDef",
-                "F5 Copy", "F6 Paste", "F7 Clear", "F8 Cut",
-                "F9 Begin", "F10 Quit", "F11 ExSave", "F12 Reload",
+                "F1 TogIdt",
+                "F2 Save",
+                "F3 Search",
+                "F4 GoDef",
+                "F5 Copy",
+                "F6 Paste",
+                "F7 Clear",
+                "F8 Cut",
+                "F9 Begin",
+                "F10 Quit",
+                "F11 ExSave",
+                "F12 Reload",
             ];
             let screen_cols = self.screen_cols as usize;
             let slot_width = screen_cols / hints.len();
@@ -382,6 +449,10 @@ impl BaseEditor {
 
     pub fn clear_current_line(&mut self) {
         if !self.lines.is_empty() {
+            if !self.lines[self.cursor_y].is_empty() {
+                let old = self.line_string(self.cursor_y);
+                self.history.record(Operation::Change, self.cursor_y, old);
+            }
             self.lines[self.cursor_y].clear();
             self.semantic_tokens[self.cursor_y].clear();
             self.cursor_x = 0;
@@ -441,21 +512,34 @@ impl BaseEditor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        let old = self.line_string(self.cursor_y);
+        self.history.record(Operation::Change, self.cursor_y, old);
         self.lines[self.cursor_y].insert(self.cursor_x, c);
         self.cursor_x += 1;
     }
 
     pub fn delete_char_at_cursor(&mut self) {
         if self.cursor_x < self.lines[self.cursor_y].len() {
+            let old = self.line_string(self.cursor_y);
+            self.history.record(Operation::Change, self.cursor_y, old);
             self.lines[self.cursor_y].remove(self.cursor_x);
         }
     }
 
     pub fn delete_char(&mut self) {
         if self.cursor_x > 0 {
+            let old = self.line_string(self.cursor_y);
+            self.history.record(Operation::Change, self.cursor_y, old);
             self.lines[self.cursor_y].remove(self.cursor_x - 1);
             self.cursor_x -= 1;
         } else if self.cursor_y > 0 {
+            let prev_old = self.line_string(self.cursor_y - 1);
+            let current_old = self.line_string(self.cursor_y);
+            self.history
+                .record(Operation::Change, self.cursor_y - 1, prev_old);
+            self.history
+                .record(Operation::Delete, self.cursor_y, current_old);
+
             self.semantic_tokens.remove(self.cursor_y);
             let current_line = self.lines.remove(self.cursor_y);
             self.cursor_y -= 1;
@@ -466,6 +550,7 @@ impl BaseEditor {
 
     pub fn insert_newline(&mut self) {
         // 1. Определяем отступ текущей строки до переноса
+        let old_line = self.line_string(self.cursor_y);
         let current_line = &self.lines[self.cursor_y];
         let mut indent_chars = Vec::new();
 
@@ -490,7 +575,12 @@ impl BaseEditor {
         }
 
         // 4. Вставляем новую строку и пустой слот для токенов подсветки
+        let new_line_str: String = next_line.iter().collect();
+        self.history
+            .record(Operation::Change, self.cursor_y, old_line);
         self.lines.insert(self.cursor_y + 1, next_line);
+        self.history
+            .record(Operation::Insert, self.cursor_y + 1, new_line_str);
         self.semantic_tokens.insert(self.cursor_y + 1, Vec::new());
 
         // 5. Переводим курсор на новую строку, смещая его на длину автоотступа
@@ -503,6 +593,11 @@ impl BaseEditor {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let old = self.line_string(self.cursor_y);
+        self.history.record(Operation::Change, self.cursor_y, old);
         for c in s.chars() {
             self.lines[self.cursor_y].insert(self.cursor_x, c);
             self.cursor_x += 1;
@@ -649,6 +744,10 @@ impl BaseEditor {
 
         if start_y == end_y {
             if start_y < self.lines.len() {
+                if start_x < end_x {
+                    let old = self.line_string(start_y);
+                    self.history.record(Operation::Change, start_y, old);
+                }
                 self.lines[start_y].drain(start_x..end_x);
                 self.semantic_tokens[start_y].clear();
             }
@@ -657,6 +756,18 @@ impl BaseEditor {
             if end_y < self.lines.len() {
                 remaining_suffix = self.lines[end_y][end_x..].to_vec();
             }
+
+            // Сначала изменение стартовой строки, затем удаление строк ниже.
+            // Удалённые строки пишем в обратном порядке (снизу вверх), чтобы
+            // undo восстанавливал их сверху вниз с правильными индексами.
+            let old_start = self.line_string(start_y);
+            //self.history.record(Operation::Change, start_y, old_start);
+            let last_deleted = end_y.min(self.lines.len().saturating_sub(1));
+            for y in ((start_y + 1)..=last_deleted).rev() {
+                let old = self.line_string(y);
+                self.history.record(Operation::Delete, y, old);
+            }
+            self.history.record(Operation::Change, start_y, old_start);
 
             if start_y + 1 < self.lines.len() {
                 let drain_end = (end_y + 1).min(self.lines.len());
@@ -701,40 +812,52 @@ impl BaseEditor {
             return;
         }
 
+        let start_y = self.cursor_y;
+        let old_line = self.line_string(start_y);
         let insert_lines: Vec<&str> = text.split('\n').collect();
 
         if insert_lines.len() == 1 {
             let chars: Vec<char> = insert_lines[0].chars().collect();
             let len = chars.len();
-            self.lines[self.cursor_y].splice(self.cursor_x..self.cursor_x, chars);
-            self.semantic_tokens[self.cursor_y].clear();
+            self.history.record(Operation::Change, start_y, old_line);
+            self.lines[start_y].splice(self.cursor_x..self.cursor_x, chars);
+            self.semantic_tokens[start_y].clear();
             self.cursor_x += len;
         } else {
-            let current_line = &mut self.lines[self.cursor_y];
+            let mut inserted_strings: Vec<String> = Vec::new();
+
+            let current_line = &mut self.lines[start_y];
             let tail: Vec<char> = current_line.split_off(self.cursor_x);
 
             current_line.extend(insert_lines[0].chars());
-            self.semantic_tokens[self.cursor_y].clear();
+            self.semantic_tokens[start_y].clear();
 
-            let mut insert_idx = self.cursor_y + 1;
+            let mut insert_idx = start_y + 1;
 
             for &middle_line in &insert_lines[1..insert_lines.len() - 1] {
                 let chars: Vec<char> = middle_line.chars().collect();
+                inserted_strings.push(middle_line.to_string());
                 self.lines.insert(insert_idx, chars);
                 self.semantic_tokens.insert(insert_idx, Vec::new());
                 insert_idx += 1;
             }
 
-            let mut last_inserted_line: Vec<char> =
-                insert_lines.last().unwrap().chars().collect();
+            let mut last_inserted_line: Vec<char> = insert_lines.last().unwrap().chars().collect();
             let last_line_len = last_inserted_line.len();
             last_inserted_line.extend(tail);
+            inserted_strings.push(last_inserted_line.iter().collect());
 
             self.lines.insert(insert_idx, last_inserted_line);
             self.semantic_tokens.insert(insert_idx, Vec::new());
 
             self.cursor_y = insert_idx;
             self.cursor_x = last_line_len;
+
+            self.history.record(Operation::Change, start_y, old_line);
+            for (offset, line) in inserted_strings.into_iter().enumerate() {
+                self.history
+                    .record(Operation::Insert, start_y + 1 + offset, line);
+            }
         }
     }
 
@@ -755,6 +878,31 @@ impl BaseEditor {
         self.cursor_y = y.min(self.lines.len().saturating_sub(1));
         self.cursor_x = x.min(self.lines[self.cursor_y].len());
         self.selection = None;
+    }
+
+    /// Ищет `query` начиная с текущей строки с переносом в начало
+    /// и перемещает курсор на найденный фрагмент.
+    pub fn find_in_editor(&mut self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+
+        let needle: Vec<char> = query.chars().collect();
+        let total = self.lines.len();
+        if total == 0 {
+            return;
+        }
+
+        for i in 0..total {
+            let y = (self.cursor_y + i) % total;
+            if let Some(x) = self.lines[y]
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+            {
+                self.set_cursor(y, x);
+                return;
+            }
+        }
     }
 }
 
@@ -791,13 +939,20 @@ impl TextInteractive for BaseEditor {
         self.update_semantic_tokens(tokens)
     }
 
-    fn set_diagnostics(
-        &mut self,
-        errors: usize,
-        warnings: usize,
-        diagnostics: Vec<LspDiagnostic>,
-    ) {
+    fn set_diagnostics(&mut self, errors: usize, warnings: usize, diagnostics: Vec<LspDiagnostic>) {
         self.set_diagnostics(errors, warnings, diagnostics)
+    }
+
+    fn diagnostics(&self) -> &[LspDiagnostic] {
+        &self.diagnostics
+    }
+
+    fn diagnostics_icon_at(&self, x: u16, y: u16) -> bool {
+        self.diagnostics_icon_at(x, y)
+    }
+
+    fn jump_to_diagnostic(&mut self, index: usize) {
+        self.jump_to_diagnostic(index)
     }
 
     fn cursor_x(&self) -> usize {
@@ -818,6 +973,10 @@ impl TextInteractive for BaseEditor {
 
     fn set_cursor(&mut self, y: usize, x: usize) {
         self.set_cursor(y, x)
+    }
+
+    fn find_in_editor(&mut self, query: &str) {
+        self.find_in_editor(query)
     }
 
     fn has_selection(&self) -> bool {
@@ -920,63 +1079,12 @@ impl TextInteractive for BaseEditor {
         self.paste_from_clipboard()
     }
 
-    fn search_substring<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
-        Box::pin(async move {
-            use futures_util::StreamExt;
+    fn undo(&mut self) {
+        self.undo()
+    }
 
-            let mut query = String::new();
-            let prompt_prefix = "Search: ";
-            let mut reader = crossterm::event::EventStream::new();
-            let mut stdout = io::stdout();
-
-            loop {
-                let _ = stdout.queue(cursor::MoveTo(0, self.screen_rows - 1));
-                let current_view = format!("{}{}", prompt_prefix, query);
-                let fill = " ".repeat(
-                    (self.screen_cols as usize).saturating_sub(current_view.len()),
-                );
-                let _ = stdout.queue(Print(format!(
-                    "\x1b[7m{}{}\x1b[m",
-                    current_view, fill
-                )));
-                let _ = stdout.flush();
-
-                if let Some(Ok(Event::Key(key))) = reader.next().await {
-                    match key.code {
-                        KeyCode::Enter => break,
-                        KeyCode::Esc => return,
-                        KeyCode::Backspace => {
-                            query.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            query.push(c);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if query.is_empty() {
-                return;
-            }
-
-            let query_chars: Vec<char> = query.chars().collect();
-            let start_y = self.cursor_y;
-
-            for i in 0..self.lines.len() {
-                let check_y = (start_y + i) % self.lines.len();
-                let line = &self.lines[check_y];
-
-                if let Some(pos) = line
-                    .windows(query_chars.len())
-                    .position(|w| w == query_chars)
-                {
-                    self.cursor_y = check_y;
-                    self.cursor_x = pos;
-                    return;
-                }
-            }
-        })
+    fn redo(&mut self) {
+        self.redo()
     }
 
     fn should_quit(&self) -> bool {
@@ -985,5 +1093,111 @@ impl TextInteractive for BaseEditor {
 
     fn quit(&mut self) {
         self.quit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor_with(lines: &[&str]) -> BaseEditor {
+        let mut editor = BaseEditor::new("test".to_string(), Vec::new());
+        editor.load_lines(lines.iter().map(|s| s.chars().collect()).collect());
+        editor
+    }
+
+    fn text(editor: &BaseEditor) -> Vec<String> {
+        editor
+            .lines
+            .iter()
+            .map(|line| line.iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn diagnostics_icon_opens_and_jumps_to_line() {
+        let mut editor = editor_with(&["one", "two", "three"]);
+        assert!(!editor.diagnostics_icon_at(10, 0));
+
+        editor.set_diagnostics(
+            1,
+            1,
+            vec![
+                LspDiagnostic {
+                    start_line: 2,
+                    start_col: 2,
+                    end_line: 2,
+                    end_col: 3,
+                    severity: 1,
+                    message: "error".to_string(),
+                },
+                LspDiagnostic {
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 1,
+                    end_col: 1,
+                    severity: 2,
+                    message: "warning".to_string(),
+                },
+            ],
+        );
+
+        let start = editor.header_left().chars().count() as u16;
+        assert!(editor.diagnostics_icon_at(start, 0));
+        assert!(editor.diagnostics_icon_at(start + 4, 0));
+        assert!(!editor.diagnostics_icon_at(start + 5, 0));
+        assert!(!editor.diagnostics_icon_at(start, 1));
+
+        editor.jump_to_diagnostic(0);
+        assert_eq!((editor.cursor_y, editor.cursor_x), (2, 2));
+
+        editor.jump_to_diagnostic(1);
+        assert_eq!((editor.cursor_y, editor.cursor_x), (1, 0));
+
+        editor.jump_to_diagnostic(99);
+        assert_eq!((editor.cursor_y, editor.cursor_x), (1, 0));
+    }
+
+    #[test]
+    fn find_in_editor_wraps_and_moves_cursor() {
+        let mut editor = editor_with(&["hello", "world", "search me"]);
+
+        editor.find_in_editor("world");
+        assert_eq!((editor.cursor_y, editor.cursor_x), (1, 0));
+
+        editor.find_in_editor("me");
+        assert_eq!((editor.cursor_y, editor.cursor_x), (2, 7));
+
+        // Начиная с последней строки поиск переносится в начало.
+        editor.find_in_editor("hello");
+        assert_eq!((editor.cursor_y, editor.cursor_x), (0, 0));
+
+        // Если фрагмент не найден, курсор остаётся на месте.
+        editor.find_in_editor("missing");
+        assert_eq!((editor.cursor_y, editor.cursor_x), (0, 0));
+    }
+
+    #[test]
+    fn multiline_selection_undo_redo() {
+        let mut editor = editor_with(&["AA", "BB", "CC", "DD", "EE"]);
+        editor.selection = Some(Selection {
+            start_x: 1,
+            start_y: 1,
+        });
+        editor.cursor_y = 3;
+        editor.cursor_x = 1;
+
+        editor.delete_selection();
+        assert_eq!(text(&editor), vec!["AA", "BD", "EE"]);
+
+        editor.undo();
+        editor.undo();
+        editor.undo();
+        assert_eq!(text(&editor), vec!["AA", "BB", "CC", "DD", "EE"]);
+
+        editor.redo();
+        editor.redo();
+        editor.redo();
+        assert_eq!(text(&editor), vec!["AA", "BD", "EE"]);
     }
 }

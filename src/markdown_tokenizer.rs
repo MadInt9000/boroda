@@ -66,12 +66,24 @@ impl MarkdownTokenizer {
 
             // 3. Обработка элементов списков и цитат (> , * , - , 1.)
             let trimmed = line_str.trim_start();
-            if trimmed.starts_with("> ") || trimmed.starts_with("* ") || trimmed.starts_with("- ") || 
-               (trimmed.len() > 2 && trimmed.chars().next().unwrap().is_ascii_digit() && trimmed.contains(". ")) {
+            if trimmed.starts_with("> ")
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with("- ")
+                || (trimmed.len() > 2
+                    && trimmed.chars().next().unwrap().is_ascii_digit()
+                    && trimmed.contains(". "))
+            {
                 let indent = line_str.len() - trimmed.len();
                 tokens.push(RenderToken {
                     start_col: indent,
-                    len: if trimmed.starts_with("> ") || trimmed.starts_with("* ") || trimmed.starts_with("- ") { 1 } else { trimmed.find('.').unwrap() + 1 },
+                    len: if trimmed.starts_with("> ")
+                        || trimmed.starts_with("* ")
+                        || trimmed.starts_with("- ")
+                    {
+                        1
+                    } else {
+                        trimmed.find('.').unwrap() + 1
+                    },
                     token_type: 6, // Синий цвет для маркеров списков
                 });
             }
@@ -85,28 +97,29 @@ impl MarkdownTokenizer {
                 for mat in regex.find_iter(&line_str) {
                     let start_byte = mat.start();
                     let end_byte = mat.end();
-                    
+
                     // Переводим байтовые смещения regex в индексы символов char
                     let start_char = line_str[..start_byte].chars().count();
                     let end_char = line_str[..end_byte].chars().count();
 
-
                     // Красим только текст внутри (например, для **жирного** пропускаем сами **)
                     //let marker_len = if regex.as_str().contains(r"\*\*") { 2 } else { 1 };
                     for i in (start_char + marker_len)..(end_char - marker_len) {
-                        if i < style_mask.len() { style_mask[i] = token_type; }
+                        if i < style_mask.len() {
+                            style_mask[i] = token_type;
+                        }
                     }
                 }
             };
 
             // Применяем регулярные выражения поочередно от менее приоритетных к более приоритетным
-            apply_style(&link_regex, 9, 0);        // Ссылки -> Подчеркнутый (3)
+            apply_style(&link_regex, 9, 0); // Ссылки -> Подчеркнутый (3)
 
-            apply_style(&italic_stars, 3, 1);       // Курсив * -> 
+            apply_style(&italic_stars, 3, 1); // Курсив * ->
             apply_style(&italic_underscores, 9, 1); // Курсив _ -> Подчеркнутый (3)
 
-            apply_style(&bold_stars, 4, 2);         // Жирный ** -> Жирный (4)
-            apply_style(&bold_underscores, 10, 2);   // Подчеркнутый жирный __ -> Жирный (11)
+            apply_style(&bold_stars, 4, 2); // Жирный ** -> Жирный (4)
+            apply_style(&bold_underscores, 10, 2); // Подчеркнутый жирный __ -> Жирный (11)
 
             apply_style(&inline_code_regex, 6, 0); // Инлайн-код -> Синий (6)
 
@@ -137,4 +150,3 @@ impl MarkdownTokenizer {
         file_tokens
     }
 }
-

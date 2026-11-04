@@ -1,37 +1,39 @@
 mod base_editor;
-mod editor;
-mod tokens;
-mod input;
-mod lsp;
-mod lsp_adapter;
-mod python_tokenizer;
-mod markdown_tokenizer;
-mod config_tokenizer;
-mod loader;
 mod clipboard;
 mod config;
+mod config_tokenizer;
+mod editor;
+mod history;
+mod input;
+mod intermediate;
+mod loader;
+mod lsp;
+mod lsp_adapter;
+mod markdown_tokenizer;
+mod modal;
+mod python_tokenizer;
 mod rx_worker;
+mod tokens;
 mod traits;
-use editor::Editor;
-use input::InputDriver;
-use loader::ProjectLoader;
-use traits::TextInteractive;
-use markdown_tokenizer::MarkdownTokenizer;
+use crate::lsp_adapter::LspParseResult;
 use config_tokenizer::ConfigTokenizer;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, EventStream},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use editor::Editor;
 use futures_util::StreamExt;
+use intermediate::IntermediateState;
+use loader::ProjectLoader;
+use markdown_tokenizer::MarkdownTokenizer;
+use rx_worker::RxWorker;
 use serde_json::Value;
 use std::env;
 use std::io;
 use std::panic;
 use std::time::Duration;
-use rx_worker::RxWorker;
 use tokio::sync::mpsc;
-use crate::lsp_adapter::LspParseResult;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -57,7 +59,10 @@ async fn main() -> io::Result<()> {
     let mut reader = EventStream::new();
     let mut has_pending_changes = false;
 
-    editors[current_editor_idx].draw(&mut stdout)?;
+    // Промежуточный слой сам открывает модалки и применяет их результаты.
+    let mut intermediate = IntermediateState::new();
+
+    editors[current_editor_idx].base.draw(&mut stdout)?;
 
     // ЧИСТЫЙ ГЛАВНЫЙ ЦИКЛ (Event Loop)
     'outer: loop {
@@ -78,7 +83,7 @@ async fn main() -> io::Result<()> {
                 // Ветка 1: Ввод пользователя (передаем ссылку на lsp_pool)
                 event_option = reader.next() => {
                     if let Some(Ok(event)) = event_option {
-                        InputDriver::handle_input(
+                        has_pending_changes = intermediate.handle_event(
                             &mut text_editors,
                             &mut file_editors,
                             &mut current_editor_idx,
@@ -86,13 +91,11 @@ async fn main() -> io::Result<()> {
                             event,
                             &mut stdout,
                         ).await?;
-
-                        has_pending_changes = true;
                     }
                 }
 
                 // Ветка 2: В цикле Debounce
-                _ = tokio::time::sleep(timeout_duration), if has_pending_changes => {
+                _ = tokio::time::sleep(timeout_duration), if has_pending_changes && !intermediate.is_modal_active() => {
                     let active_text = &mut *text_editors[current_editor_idx];
                     let ext = std::path::Path::new(file_editors[current_editor_idx].filename())
                         .extension()
@@ -123,7 +126,7 @@ async fn main() -> io::Result<()> {
                 }
 
                 // Ветка 3: Ответы от серверов (обрабатываются в rx_worker)
-                lsp_msg_option = global_rx.recv() => {
+                lsp_msg_option = global_rx.recv(), if !intermediate.is_modal_active() => {
                     if let Some(lsp_msg) = lsp_msg_option {
                         new_file = RxWorker::handle_message(
                             &lsp_msg,

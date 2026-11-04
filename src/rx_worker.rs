@@ -41,11 +41,19 @@ impl RxWorker {
                         text.update_semantic_tokens(ready_tokens);
                         state_changed = true;
                     }
-                    LspParseResult::Diagnostics { errors, warnings, diagnostics } => {
+                    LspParseResult::Diagnostics {
+                        errors,
+                        warnings,
+                        diagnostics,
+                    } => {
                         text.set_diagnostics(errors, warnings, diagnostics);
                         state_changed = true;
                     }
-                    LspParseResult::Definition { abs_path, line, col } => {
+                    LspParseResult::Definition {
+                        abs_path,
+                        line,
+                        col,
+                    } => {
                         // Проверяем, что этот ответ пришел именно на запрос данного редактора
                         goto_target = Some((abs_path, line, col));
                     }

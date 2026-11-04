@@ -1,8 +1,8 @@
 use lsp_types::Url;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex; // Используем СИНХРОННЫЙ мьютекс для внутренней мутабельности
-use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -43,7 +43,7 @@ impl LspClient {
     /// Полностью СИНХРОННЫЙ метод старта. Просто проверяет флаг и запускает процесс.
     pub fn start(&self, current_dir: &str, global_tx: mpsc::UnboundedSender<Value>) {
         let mut state = self.inner.lock().unwrap();
-        
+
         // 1. Проверяем флаг — если уже запущен, ничего не делаем
         if state.is_started {
             return;
@@ -120,7 +120,9 @@ impl LspClient {
                     }
                 }
 
-                if content_length == 0 { return; }
+                if content_length == 0 {
+                    return;
+                }
 
                 let mut buf = vec![0u8; content_length];
                 if reader.read_exact(&mut buf).await.is_ok() {
@@ -155,7 +157,7 @@ impl LspClient {
     pub fn send_initialize(&self, current_dir: &str) {
         let path = Path::new(current_dir);
         let root_url = Url::from_directory_path(path).unwrap();
-        
+
         let msg = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -208,7 +210,8 @@ impl LspClient {
     }
 
     pub fn request_semantic_tokens_with_id(&self, filename: &str, request_id: i64) {
-        let abs_path = std::fs::canonicalize(filename).unwrap_or_else(|_| Path::new(filename).to_path_buf());
+        let abs_path =
+            std::fs::canonicalize(filename).unwrap_or_else(|_| Path::new(filename).to_path_buf());
         let file_url = Url::from_file_path(&abs_path).unwrap();
 
         let msg = json!({
@@ -224,4 +227,3 @@ impl LspClient {
         self.send_raw_message(json_str);
     }
 }
-

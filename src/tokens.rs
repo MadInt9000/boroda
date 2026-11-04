@@ -18,5 +18,7 @@ pub struct LspDiagnostic {
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    /// 1 — ошибка, 2 — предупреждение, остальное — прочее.
+    pub severity: u8,
     pub message: String,
 }
