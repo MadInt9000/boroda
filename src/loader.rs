@@ -1,122 +1,162 @@
+use crate::config::Configuration;
+use crate::config_tokenizer::ConfigTokenizer;
 use crate::editor::Editor;
 use crate::lsp::LspClient;
 use crate::lsp_adapter::LspAdapter;
-
-use std::collections::HashMap;
+use crate::markdown_tokenizer::MarkdownTokenizer;
+use crate::python_tokenizer::PythonTokenizer;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::env;
 use std::path::Path;
 use tokio::sync::mpsc;
-use serde_json::Value;
 
 pub struct ProjectLoader;
 
 impl ProjectLoader {
-    /// Вспомогательный метод для определения ключа сервера по расширению
-    pub fn get_server_key(filename: &str) -> Option<&'static str> {
-        let ext = Path::new(filename).extension().and_then(|s| s.to_str()).unwrap_or("");
-        match ext {
-            "py" => Some("py"),
-            "rs" => Some("rs"),
-            "php" => Some("php"),
-            _ => None,
+    /// Возвращает прямую ссылку на LspClient из пула на основе расширения файла
+    pub fn get_server_client<'a>(
+        filename: &str,
+        lsp_pool: &'a [LspClient],
+    ) -> Option<&'a LspClient> {
+        let ext = Path::new(filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let config = Configuration::global();
+
+        // Получаем строку-идентификатор (например, "python") для этого расширения
+        if let Some(server_id) = config.file_types.get(ext) {
+            // Ищем в пуле сервер, у которого совпадает server_id
+            return lsp_pool
+                .iter()
+                .find(|client| client.server_id == *server_id);
         }
+        None
     }
 
-    /// Метод для полной загрузки ОДИНОЧНОГО файла. 
-    /// Создает экземпляр Editor, при необходимости запускает LspClient и связывает их.
+    /// ДИНАМИЧЕСКИЙ ПУЛ: Создает заглушки серверов строго на основе конфигурации JSON
+    pub fn create_empty_pool() -> Vec<LspClient> {
+        let config = Configuration::global();
+        let mut pool = Vec::new();
+
+        for server_id in config.lsp_servers.keys() {
+            pool.push(LspClient::new_stub(server_id.clone()));
+        }
+        pool
+    }
+
+    // Метод снова СИНХРОННЫЙ
     pub fn load_single_file(
-        filename: String,
-        lsp_pool: &mut HashMap<&'static str, LspClient>,
+        raw_filename: String,
+        lsp_pool: &[LspClient], // Передаем как обычный срез пула
         global_tx: mpsc::UnboundedSender<Value>,
         current_dir: &str,
     ) -> Editor {
-        let mut editor = Editor::new(filename);
-        
-        if let Some(key) = Self::get_server_key(&editor.filename) {
-            // Создаем чистый адаптер метаданных
-            let mut adapter = LspAdapter::new(&editor.filename);
-
-            // Ленивый запуск LspClient, если для этого языка сервер еще не поднят
-            if !lsp_pool.contains_key(key) {
-                let cmd = match key {
-                    "py" => "pyright-langserver",
-                    "rs" => "rust-analyzer",
-                    "php" => "intelephense",
-                    _ => "",
-                };
-                
-                let (client, mut rx) = LspClient::start(cmd, current_dir);
-                let tx = global_tx.clone();
-                
-                // Перенаправляем сообщения сервера в единый глобальный канал
-                tokio::spawn(async move {
-                    while let Some(msg) = rx.recv().await {
-                        let _ = tx.send(msg);
-                    }
-                });
-                client.send_initialize(current_dir);                
-                lsp_pool.insert(key, client);
+        let path = Path::new(&raw_filename);
+        //let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            // 2. ФОЛЛБЭК: Если файла нет на диске, проверяем, абсолютный ли он изначально
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                // 3. Если путь относительный, вручную склеиваем его с текущей рабочей директорией
+                let mut base = std::env::current_dir()
+                    .unwrap_or_else(|_| Path::new(current_dir).to_path_buf());
+                base.push(path);
+                base
             }
+        });
+        let abs_filename_str = abs_path.to_string_lossy().into_owned();
+        let mut editor = Editor::new(abs_filename_str.clone());
+        editor.file.filename = abs_filename_str;
+        let ext = Path::new(&editor.file.filename)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
 
-            //editor.lsp_adapter = Some(adapter);
-            // Извлекаем ссылку на клиент из пула для отправки первичных уведомлений
-//            if let Some(client) = lsp_pool.get(key) {
-//                let text_content = editor.get_all_text();
-//                adapter.did_open(client, &text_content);
-//                adapter.request_syntax_tokens(client, &editor.lines);
-//            }
+        // Получаем прямую ссылку на клиент вместо индекса
+        if let Some(client) = Self::get_server_client(&editor.file.filename, lsp_pool) {
+            let adapter = LspAdapter::new(editor.file.filename.clone());
 
-            editor.lsp_adapter = Some(adapter);
+            // Запускаем сервер напрямую через ссылку
+            client.start(current_dir, global_tx);
+            editor.file.lsp_adapter = Some(adapter);
+
+            // Проверяем по строковому ID
+            if client.server_id == "python" {
+                let local_tokens = PythonTokenizer::tokenize_text(&editor.base.lines);
+                editor.base.update_semantic_tokens(local_tokens);
+            }
+        } else if ext == "md" {
+            // НОВОЕ: Если это Markdown-файл, запускаем наш локальный токенизатор
+            let local_tokens = MarkdownTokenizer::tokenize_text(&editor.base.lines);
+            editor.base.update_semantic_tokens(local_tokens);
+        } else if matches!(ext, "json" | "toml" | "ini" | "conf") {
+            // НОВОЕ: Парсим конфигурационные файлы при первичной загрузке
+            let local_tokens = ConfigTokenizer::tokenize_text(&editor.base.lines);
+            editor.base.update_semantic_tokens(local_tokens);
         }
 
-        // Обновляем геометрию окна под терминал и скроллим
-        let _ = editor.update_window_size();
-        editor.scroll();
-        
+        let _ = editor.base.update_window_size();
+        editor.base.scroll();
         editor
     }
 
-    /// Главный метод загрузки проекта. 
-    /// Сканирует окружение и делегирует создание каждого файла методу load_single_file.
+    // Метод снова СИНХРОННЫЙ
     pub fn load_project(
         global_tx: mpsc::UnboundedSender<Value>,
         current_dir: &str,
-    ) -> (Vec<Editor>, HashMap<&'static str, LspClient>) {
-        let mut lsp_pool: HashMap<&'static str, LspClient> = HashMap::new();
+    ) -> (Vec<Editor>, Vec<LspClient>) {
+        let lsp_pool = Self::create_empty_pool();
         let mut filenames: Vec<String> = env::args().skip(1).collect();
+        let config = Configuration::global();
 
-        // Сканируем папку при отсутствии аргументов командной строки
+        // Один общий набор расширений: LSP-типы + дополнительные автозагружаемые.
+        let autoload_exts: HashSet<&str> = config
+            .file_types
+            .keys()
+            .map(String::as_str)
+            .chain(config.autoload_extra.iter().map(String::as_str))
+            .collect();
+
         if filenames.is_empty() {
-            if let Ok(entries) = std::fs::read_dir(".") {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_file() {
-                            let path = entry.path();
-                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                                if matches!(ext, "py" | "rs" | "php") {
-                                    filenames.push(path.to_string_lossy().into_owned());
-                                }
-                            }
-                        }
-                    }
+            let entries = std::fs::read_dir(".")
+                .map(|entries| entries.flatten().collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            for entry in entries {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() {
+                    continue;
                 }
+
+                let path = entry.path();
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if !autoload_exts.contains(ext) {
+                    continue;
+                }
+
+                filenames.push(path.to_string_lossy().into_owned());
             }
         }
 
-        // Фоллбэк для пустого проекта
         if filenames.is_empty() {
             filenames.push("untitled.txt".to_string());
         }
 
-        // Вызываем метод загрузки единичного файла для каждого элемента в цикле
+        // Детерминированный порядок: сортируем по полному пути, а не по имени.
+        filenames.sort();
+
         let mut editors = Vec::new();
         for filename in filenames {
-            let editor = Self::load_single_file(
-                filename, 
-                &mut lsp_pool, 
-                global_tx.clone(), 
-                current_dir
-            );
+            // Синхронный вызов без всяких .await
+            let editor =
+                Self::load_single_file(filename, &lsp_pool, global_tx.clone(), current_dir);
             editors.push(editor);
         }
 

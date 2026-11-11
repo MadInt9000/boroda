@@ -1,123 +1,274 @@
-use crate::editor::Editor;
 use crate::lsp::LspClient;
-use crate::loader::ProjectLoader;
+use crate::traits::{FileOperations, ModalInteractive, TextInteractive};
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
-use std::collections::HashMap;
 use std::io;
 
 pub struct InputDriver;
 
 impl InputDriver {
-    /// Обрабатывает пользовательский ввод. 
-    /// Принимает стек всех редакторов, индекс текущего активного файла и ссылку на пул серверов.
+    /// Обрабатывает ввод только для активного редактора.
+    ///
+    /// Выбор активного редактора и его переключение — ответственность
+    /// `IntermediateState`, поэтому сюда приходят конкретные экземпляры,
+    /// а не векторы редакторов.
     pub async fn handle_input(
-        editors: &mut Vec<Editor>, 
-        current_idx: &mut usize, 
-        lsp_pool: &HashMap<&'static str, LspClient>,
-        event: Event
+        text_editor: &mut dyn TextInteractive,
+        file_editor: &mut dyn FileOperations,
+        lsp_pool: &[LspClient],
+        event: Event,
+        stdout: &mut io::Stdout,
     ) -> io::Result<()> {
-        let editor = &mut editors[*current_idx];
+        Self::process_event(text_editor, file_editor, lsp_pool, event).await?;
 
+        // Отображение — тоже часть интерактивного текстового слоя
+        text_editor.update_window_size()?;
+        text_editor.scroll();
+        text_editor.draw(stdout)?;
+
+        Ok(())
+    }
+
+    /// Транслирует низкоуровневые клавиши/мышь в смысловые методы
+    /// `ModalInteractive` и перерисовывает модалку.
+    ///
+    /// Проверка результата (`take_result`) и его применение остаются
+    /// на стороне `IntermediateState`.
+    pub fn handle_modal_input(
+        modal: &mut dyn ModalInteractive,
+        event: Event,
+        stdout: &mut io::Stdout,
+    ) -> io::Result<()> {
         match event {
-            // 1. Обработка клавиатуры
             Event::Key(key) => {
-                // Модификатор CTRL: переключение между открытыми файлами (вкладками)
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let KeyCode::Char(c) = key.code {
+                        modal.control_char(c);
+                    }
+                } else {
                     match key.code {
-                        KeyCode::PageUp => {
-                            if *current_idx > 0 {
-                                *current_idx -= 1;
+                        KeyCode::Left => modal.move_left(),
+                        KeyCode::Right => modal.move_right(),
+                        KeyCode::Up => modal.move_up(),
+                        KeyCode::Down => modal.move_down(),
+                        KeyCode::PageUp => modal.page_up(),
+                        KeyCode::PageDown => modal.page_down(),
+                        KeyCode::Home => modal.move_to_start(),
+                        KeyCode::End => modal.move_to_end(),
+                        KeyCode::Tab => modal.tab(),
+                        KeyCode::Char(c) => modal.character_input(c),
+                        KeyCode::Backspace => modal.delete_backward(),
+                        KeyCode::Delete => modal.delete_forward(),
+                        KeyCode::Enter => modal.submit(),
+                        KeyCode::Esc => modal.close_modal(),
+                        _ => {}
+                    }
+                }
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    modal.mouse_click(mouse.column, mouse.row)
+                }
+                MouseEventKind::Down(MouseButton::Right) => modal.close_modal(),
+                MouseEventKind::ScrollUp => modal.mouse_scroll(true),
+                MouseEventKind::ScrollDown => modal.mouse_scroll(false),
+                _ => {}
+            },
+            _ => {}
+        }
+
+        modal.draw(stdout)
+    }
+
+    async fn process_event(
+        text_editor: &mut dyn TextInteractive,
+        file_editor: &mut dyn FileOperations,
+        lsp_pool: &[LspClient],
+        event: Event,
+    ) -> io::Result<()> {
+        match event {
+            Event::Key(key) => {
+                let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                let has_control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                // Управление выделением при зажатом Shift
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                ) {
+                    if has_shift {
+                        text_editor.begin_selection();
+                    } else {
+                        text_editor.clear_selection();
+                    }
+                }
+
+                // CTRL-комбинации
+                if has_control {
+                    match key.code {
+                        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'z') => {
+                            if has_shift {
+                                text_editor.redo();
                             } else {
-                                *current_idx = editors.len() - 1; // Циклический переход в конец
+                                text_editor.undo();
                             }
                             return Ok(());
                         }
-                        KeyCode::PageDown => {
-                            if *current_idx < editors.len() - 1 {
-                                *current_idx += 1;
-                            } else {
-                                *current_idx = 0; // Циклический переход в начало
-                            }
+                        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'y') => {
+                            text_editor.redo();
+                            return Ok(());
+                        }
+                        KeyCode::Left => {
+                            text_editor.move_word_left();
+                            return Ok(());
+                        }
+                        KeyCode::Right => {
+                            text_editor.move_word_right();
+                            return Ok(());
+                        }
+                        KeyCode::Insert => {
+                            text_editor.paste_from_clipboard();
                             return Ok(());
                         }
                         _ => {}
                     }
                 }
 
-                // Стандартные горячие клавиши и ввод текста для текущего активного файла
+                // Файловые операции
                 match key.code {
-                    KeyCode::F(1)  => editor.toggle_indent(),
-                    
-                    // F2: Сохранение файла и отправка didSave уведомления по ссылке из пула
-                    KeyCode::F(2)  => {
-                        editor.save_file()?;
-                        if let (Some(ref lsp), Some(key)) = (&editor.lsp_adapter, ProjectLoader::get_server_key(&editor.filename)) {
-                            if let Some(client) = lsp_pool.get(key) {
-                                lsp.send_save_notification(client);
-                            }
-                        }
+                    KeyCode::F(2) => {
+                        Self::save(text_editor, file_editor, lsp_pool)?;
+                        return Ok(());
                     }
-                    
-                    KeyCode::F(3)  => editor.search_substring().await,
-                    KeyCode::F(4)  => { /* Зарезервировано для создания/открытия файла */ }
-                    KeyCode::F(5)  => editor.clear_current_line(),
-                    KeyCode::F(6)  => { /* Зарезервировано под Info / Go to Definition */ }
-                    KeyCode::F(7)  => editor.cut_line(),
-                    KeyCode::F(8)  => editor.paste_line(),
-                    KeyCode::F(9)  => editor.move_to_line_start(),
-                    KeyCode::F(10) => editor.quit(),
-                    
-                    // F11: Сохранение файла, уведомление LSP и закрытие редактора
+                    KeyCode::F(4) => {
+                        let line = text_editor.cursor_y();
+                        let col = text_editor.cursor_x();
+                        if let Some(lsp) = file_editor.lsp_adapter() {
+                            lsp.request_definition(lsp_pool, line, col);
+                        }
+                        return Ok(());
+                    }
                     KeyCode::F(11) => {
-                        editor.save_file()?;
-                        if let (Some(ref lsp), Some(key)) = (&editor.lsp_adapter, ProjectLoader::get_server_key(&editor.filename)) {
-                            if let Some(client) = lsp_pool.get(key) {
-                                lsp.send_save_notification(client);
-                            }
-                        }
-                        editor.quit();
+                        Self::save(text_editor, file_editor, lsp_pool)?;
+                        text_editor.quit();
+                        return Ok(());
                     }
-                    
-                    KeyCode::F(12) => editor.reload_file(),
+                    KeyCode::F(12) => {
+                        let lines = file_editor.reload_file()?;
+                        text_editor.load_lines(lines);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
 
-                    // Навигация и редактирование
-                    KeyCode::PageUp   => editor.page_up(),
-                    KeyCode::PageDown => editor.page_down(),
-                    KeyCode::Home     => editor.move_to_line_start(),
-                    KeyCode::End      => editor.move_to_line_end(),
-                    KeyCode::Up        => editor.move_up(),
-                    KeyCode::Down      => editor.move_down(),
-                    KeyCode::Left      => editor.move_left(),
-                    KeyCode::Right     => editor.move_right(),
-                    
-                    // Табуляция (вставка 4-х пробелов)
-                    KeyCode::Tab       => editor.insert_str("    "),
-                    
-                    // Символьный ввод и удаление
-                    KeyCode::Char(c)   => editor.insert_char(c),
-                    KeyCode::Backspace => editor.delete_char(),
-                    KeyCode::Enter     => editor.insert_newline(),
+                // Текстовые операции и навигация
+                match key.code {
+                    KeyCode::F(1) => text_editor.toggle_indent(),
+                    KeyCode::F(5) => text_editor.copy_to_clipboard(),
+                    KeyCode::F(6) => text_editor.paste_from_clipboard(),
+                    KeyCode::F(7) => text_editor.clear_current_line(),
+                    KeyCode::F(8) => text_editor.cut_to_clipboard(),
+                    //пока на F9 список открытых файлов KeyCode::F(9) => text_editor.move_to_line_start(),
+                    KeyCode::PageUp => text_editor.page_up(),
+                    KeyCode::PageDown => text_editor.page_down(),
+                    KeyCode::Home => text_editor.move_to_line_start(),
+                    KeyCode::End => text_editor.move_to_line_end(),
+                    KeyCode::Up => text_editor.move_up(),
+                    KeyCode::Down => text_editor.move_down(),
+                    KeyCode::Left => text_editor.move_left(),
+                    KeyCode::Right => text_editor.move_right(),
+
+                    KeyCode::Delete => {
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
+                        } else {
+                            text_editor.delete_char_at_cursor();
+                        }
+                    }
+                    KeyCode::Tab if has_control => {}
+                    KeyCode::Tab => {
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
+                        }
+                        text_editor.insert_str("    ");
+                    }
+                    KeyCode::Char(c) => {
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
+                        }
+                        text_editor.insert_char(c);
+                    }
+                    KeyCode::Backspace => {
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
+                        } else {
+                            text_editor.delete_char();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if text_editor.has_selection() {
+                            text_editor.delete_selection();
+                        }
+                        text_editor.insert_newline();
+                    }
                     _ => {}
                 }
             }
-            
-            // 2. Обработка мыши
+
             Event::Mouse(mouse_event) => {
+                //let has_shift = mouse_event.modifiers.contains(KeyModifiers::SHIFT);
+                let has_control = mouse_event.modifiers.contains(KeyModifiers::CONTROL);
+
                 match mouse_event.kind {
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        text_editor.click_mouse(mouse_event.column, mouse_event.row);
+                        if !text_editor.has_selection() {
+                            text_editor.begin_selection();
+                        }
+                    }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        editor.click_mouse(mouse_event.column, mouse_event.row);
+                        text_editor.clear_selection();
+                        text_editor.click_mouse(mouse_event.column, mouse_event.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if has_control {
+                            let line = text_editor.row_offset() + mouse_event.row as usize - 1;
+                            let col = text_editor.col_offset() + mouse_event.column as usize;
+
+                            if let Some(lsp) = file_editor.lsp_adapter() {
+                                lsp.request_definition(lsp_pool, line, col);
+                            }
+                        }
                     }
                     MouseEventKind::ScrollUp => {
-                        editor.move_up();
+                        text_editor.clear_selection();
+                        text_editor.move_up();
+                        text_editor.move_up();
+                        text_editor.move_up();
                     }
                     MouseEventKind::ScrollDown => {
-                        editor.move_down();
+                        text_editor.clear_selection();
+                        text_editor.move_down();
+                        text_editor.move_down();
+                        text_editor.move_down();
                     }
                     _ => {}
                 }
             }
             _ => {}
         }
+
+        Ok(())
+    }
+
+    fn save(
+        text_editor: &mut dyn TextInteractive,
+        file_editor: &dyn FileOperations,
+        lsp_pool: &[LspClient],
+    ) -> io::Result<()> {
+        let lines = text_editor.lines();
+        file_editor.save_file(lines)?;
+        file_editor.notify_saved(lsp_pool);
+        text_editor.mark_saved();
         Ok(())
     }
 }

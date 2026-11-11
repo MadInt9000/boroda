@@ -1,27 +1,39 @@
+mod base_editor;
+mod clipboard;
+mod config;
+mod config_tokenizer;
 mod editor;
-mod tokens;
+mod history;
 mod input;
+mod intermediate;
+mod loader;
 mod lsp;
 mod lsp_adapter;
+mod markdown_tokenizer;
+mod modal;
 mod python_tokenizer;
-mod loader;
-
-use input::InputDriver;
-use loader::ProjectLoader;
-
+mod rx_worker;
+mod tokens;
+mod traits;
+use crate::lsp_adapter::LspParseResult;
+use config_tokenizer::ConfigTokenizer;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, EventStream},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use editor::Editor;
 use futures_util::StreamExt;
+use intermediate::IntermediateState;
+use loader::ProjectLoader;
+use markdown_tokenizer::MarkdownTokenizer;
+use rx_worker::RxWorker;
 use serde_json::Value;
 use std::env;
 use std::io;
 use std::panic;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use crate::lsp_adapter::LspParseResult;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -41,97 +53,120 @@ async fn main() -> io::Result<()> {
     let (global_tx, mut global_rx) = mpsc::unbounded_channel::<Value>();
 
     // --- Вся логика инициализации ушла в ProjectLoader ---
-    let (mut editors, lsp_pool) = ProjectLoader::load_project(global_tx, &current_dir);
+    let (mut editors, lsp_pool) = ProjectLoader::load_project(global_tx.clone(), &current_dir);
 
     let mut current_editor_idx = 0;
     let mut reader = EventStream::new();
     let mut has_pending_changes = false;
 
-    editors[current_editor_idx].draw(&mut stdout)?;
+    // Промежуточный слой сам открывает модалки и применяет их результаты.
+    let mut intermediate = IntermediateState::new();
+
+    editors[current_editor_idx].base.draw(&mut stdout)?;
 
     // ЧИСТЫЙ ГЛАВНЫЙ ЦИКЛ (Event Loop)
-    while !editors[current_editor_idx].should_quit {
-        let timeout_duration = if has_pending_changes {
-            Duration::from_millis(700)
-        } else {
-            Duration::from_secs(3600 * 24)
-        };
+    'outer: loop {
+        // Представления собираются один раз на входе и пересобираются
+        // только если набор редакторов изменился (например, открыт новый файл).
+        let (mut text_editors, mut file_editors) = Editor::split_views(&mut editors);
 
-        tokio::select! {
-            // Ветка 1: Ввод пользователя (передаем ссылку на lsp_pool)
-            event_option = reader.next() => {
-                if let Some(Ok(event)) = event_option {
-                    InputDriver::handle_input(&mut editors, &mut current_editor_idx, &lsp_pool, event).await?;
-                    if editors[current_editor_idx].should_quit { break; }
+        while !text_editors[current_editor_idx].should_quit() {
+            let timeout_duration = if has_pending_changes {
+                Duration::from_millis(700)
+            } else {
+                Duration::from_secs(3600 * 24)
+            };
 
-                    editors[current_editor_idx].update_window_size()?;
-                    editors[current_editor_idx].scroll();
-                    editors[current_editor_idx].draw(&mut stdout)?;
-                    has_pending_changes = true;
+            let mut new_file: Option<(String, usize, usize)> = None;
+
+            tokio::select! {
+                // Ветка 1: Ввод пользователя (передаем ссылку на lsp_pool)
+                event_option = reader.next() => {
+                    if let Some(Ok(event)) = event_option {
+                        has_pending_changes = intermediate.handle_event(
+                            &mut text_editors,
+                            &mut file_editors,
+                            &mut current_editor_idx,
+                            &lsp_pool,
+                            event,
+                            &mut stdout,
+                        ).await?;
+                    }
+                }
+
+                // Ветка 2: В цикле Debounce
+                _ = tokio::time::sleep(timeout_duration), if has_pending_changes && !intermediate.is_modal_active() => {
+                    let active_text = &mut *text_editors[current_editor_idx];
+                    let ext = std::path::Path::new(file_editors[current_editor_idx].filename())
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+
+                    if let Some(lsp) = file_editors[current_editor_idx].lsp_adapter() {
+                        let text_content = active_text.get_all_text();
+
+                        // Всё вызывается синхронно!
+                        lsp.send_change_notification(&lsp_pool, &text_content);
+
+                        if let Some(LspParseResult::Tokens(local_tokens)) =
+                            lsp.request_syntax_tokens(&lsp_pool, active_text.lines())
+                        {
+                            active_text.update_semantic_tokens(local_tokens);
+                        }
+                    } else if ext == "md" {
+                        // НОВОЕ: Пересчитываем локальные Markdown токены при изменении текста
+                        let local_tokens = MarkdownTokenizer::tokenize_text(active_text.lines());
+                        active_text.update_semantic_tokens(local_tokens);
+                    } else if matches!(ext, "json" | "toml" | "ini" | "conf") {
+                        // НОВОЕ: Пересчитываем токены конфигурации при редактировании
+                        let local_tokens = ConfigTokenizer::tokenize_text(active_text.lines());
+                        active_text.update_semantic_tokens(local_tokens);
+                    }
+                    has_pending_changes = false;
+                }
+
+                // Ветка 3: Ответы от серверов (обрабатываются в rx_worker)
+                lsp_msg_option = global_rx.recv() => {
+                    if let Some(lsp_msg) = lsp_msg_option {
+                        new_file = RxWorker::handle_message(
+                            &lsp_msg,
+                            &mut text_editors,
+                            &mut file_editors,
+                            &mut current_editor_idx,
+                            &lsp_pool,
+                            &mut stdout,
+                            !intermediate.is_modal_active()
+                        )?;
+                    }
                 }
             }
 
-            // Ветка 2: Таймер затишья (Debounce)
-            _ = tokio::time::sleep(timeout_duration), if has_pending_changes => {
-                let active_editor = &mut editors[current_editor_idx];
-                
-                if let (Some(ref lsp), Some(key)) = (&active_editor.lsp_adapter, ProjectLoader::get_server_key(&active_editor.filename)) {
-                    if let Some(client) = lsp_pool.get(key) {
-                        let text_content = active_editor.get_all_text();
-                        
-                        lsp.send_change_notification(client, &text_content);
+            // Определение указывает на неоткрытый файл: освобождаем представления,
+            // добавляем редактор и заходим в цикл заново с новыми векторами.
+            if let Some((target_path, line, col)) = new_file {
+                drop(text_editors);
+                drop(file_editors);
 
-                        // Вызываем метод и передаем срез строк буфера. 
-                        // Если это Python — мы сразу получим и применим локальные токены.
-                        if let Some(LspParseResult::Tokens(local_tokens)) = lsp.request_syntax_tokens(client, &active_editor.lines) {
-                            active_editor.update_semantic_tokens(local_tokens);
-                        }
-                    }
-                }
-                has_pending_changes = false;
-            }
+                let new_editor = ProjectLoader::load_single_file(
+                    target_path,
+                    &lsp_pool,
+                    global_tx.clone(),
+                    &current_dir,
+                );
+                editors.push(new_editor);
+                current_editor_idx = editors.len() - 1;
 
-            // Ветка 3: Ответы от серверов в src/main.rs
-            lsp_msg_option = global_rx.recv() => {
-                if let Some(lsp_msg) = lsp_msg_option {
-                    let mut state_changed = false;
-                    
-                    for editor in &mut editors {
-                        // 1. Предварительно собираем атомарные данные из editor
-                        let text_content = editor.get_all_text();
-                        let total_lines = editor.lines.len();
+                editors[current_editor_idx].base.set_cursor(line, col);
+                editors[current_editor_idx].base.update_window_size()?;
+                editors[current_editor_idx].base.scroll();
+                editors[current_editor_idx].base.draw(&mut stdout)?;
 
-                        // 2. Спокойно вызываем парсинг — никакого конфликта заимствований больше нет!
-                        let parse_result = if let Some(ref lsp) = editor.lsp_adapter {
-                            lsp.parse_lsp_message(&lsp_pool, &lsp_msg, &text_content, total_lines)
-                        } else {
-                            None
-                        };
-
-                        if let Some(result) = parse_result {
-                            match result {
-                                LspParseResult::Tokens(ready_tokens) => {
-                                    editors[current_editor_idx].update_semantic_tokens(ready_tokens);
-                                    break;
-                                }
-                                LspParseResult::Diagnostics { errors, warnings, diagnostics } => {
-                                    editor.error_count = errors;
-                                    editor.warning_count = warnings;
-                                    editor.diagnostics = diagnostics;
-                                }
-                            }
-                            state_changed = true;
-                        }
-                    }
-
-                    if state_changed {
-                        editors[current_editor_idx].update_window_size()?;
-                        editors[current_editor_idx].scroll();
-                        editors[current_editor_idx].draw(&mut stdout)?;
-                    }
-                }
+                has_pending_changes = true;
+                continue 'outer;
             }
         }
+
+        break;
     }
 
     execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
