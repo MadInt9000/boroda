@@ -107,15 +107,12 @@ impl IntermediateState {
 
     fn hotkey(event: &Event, current_editor: &dyn TextInteractive) -> Option<ModalHotkey> {
         match event {
-            Event::Key(key) => {
-                let has_control = key.modifiers.contains(KeyModifiers::CONTROL);
-                match key.code {
-                    KeyCode::F(3) => Some(ModalHotkey::Search),
-                    KeyCode::F(10) => Some(ModalHotkey::ConfirmExit),
-                    KeyCode::Tab if has_control => Some(ModalHotkey::SwitchEditor),
-                    _ => None,
-                }
-            }
+            Event::Key(key) => match key.code {
+                KeyCode::F(3) => Some(ModalHotkey::Search),
+                KeyCode::F(10) => Some(ModalHotkey::ConfirmExit),
+                KeyCode::F(9) => Some(ModalHotkey::SwitchEditor),
+                _ => None,
+            },
             // Клик по верхней строке открывает меню файлов, а клик по значкам
             // ошибок/предупреждений — меню диагностик.
             Event::Mouse(mouse) => match mouse.kind {

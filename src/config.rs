@@ -11,7 +11,7 @@ pub struct LspServerConfig {
 }
 
 fn default_autoload_extra() -> Vec<String> {
-    ["md", "ini", "conf", "txt"]
+    ["md", "ini", "conf", "json", "txt"]
         .iter()
         .map(|ext| ext.to_string())
         .collect()
@@ -65,8 +65,8 @@ impl Default for Configuration {
         default_palette.insert("3".to_string(), "\x1b[3;32m".to_string()); // Литералы
         default_palette.insert("4".to_string(), "\x1b[0;92m".to_string()); // Конструкторы
         default_palette.insert("5".to_string(), "\x1b[0;95m".to_string()); // Трейты
-        default_palette.insert("6".to_string(), "\x1b[0;96m".to_string()); // Операторы
-        default_palette.insert("7".to_string(), "\x1b[1;34m".to_string()); // Макросы
+        default_palette.insert("6".to_string(), "\x1b[1;34m".to_string()); // Операторы
+        default_palette.insert("7".to_string(), "\x1b[0;34m".to_string()); // Макросы
         default_palette.insert("8".to_string(), "\x1b[0;93m".to_string()); // Вызовы методов
         default_palette.insert("9".to_string(), "\x1b[4;32m".to_string()); // Импорты
         default_palette.insert("10".to_string(), "\x1b[0;36m".to_string());

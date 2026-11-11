@@ -6,10 +6,12 @@ use std::io;
 /// Всё, что относится к интерактивному тексту:
 /// курсор, ввод, выделение, блоки, поиск и отрисовка.
 pub trait TextInteractive {
-    fn title(&self) -> &str;
+    fn title(&self) -> String;
     fn lines(&self) -> &Vec<Vec<char>>;
     fn get_all_text(&self) -> String;
     fn load_lines(&mut self, lines: Vec<Vec<char>>);
+    /// Помечает текущее содержимое как сохранённое (убирает признак изменений).
+    fn mark_saved(&mut self);
 
     fn update_window_size(&mut self) -> io::Result<()>;
     fn scroll(&mut self);

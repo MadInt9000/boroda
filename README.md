@@ -18,6 +18,8 @@ dialogs and multi-file editing.
   clear-current-line and auto-indent toggle.
 - System clipboard support (with an in-memory fallback when no clipboard is available).
 - Line-based undo/redo with merging of consecutive edits on the same line.
+- Matching `{}`, `[]` and `()` brackets are highlighted when the cursor is on one of them.
+- Unsaved changes are marked with `*` after the filename in the header.
 
 ### Multi-file workflow
 

@@ -19,6 +19,7 @@ impl RxWorker {
         current_editor_idx: &mut usize,
         lsp_pool: &[LspClient],
         stdout: &mut io::Stdout,
+        unlocked: bool,
     ) -> io::Result<Option<(String, usize, usize)>> {
         let mut state_changed = false;
         let mut goto_target = None;
@@ -87,7 +88,7 @@ impl RxWorker {
             }
         }
 
-        if state_changed {
+        if unlocked && state_changed {
             let editor = &mut *text_editors[*current_editor_idx];
             editor.update_window_size()?;
             editor.scroll();

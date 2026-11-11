@@ -121,19 +121,27 @@ impl ProjectLoader {
             .collect();
 
         if filenames.is_empty() {
-            if let Ok(entries) = std::fs::read_dir(".") {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_file() {
-                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                                if autoload_exts.contains(ext) {
-                                    filenames.push(path.to_string_lossy().into_owned());
-                                }
-                            }
-                        }
-                    }
+            let entries = std::fs::read_dir(".")
+                .map(|entries| entries.flatten().collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            for entry in entries {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() {
+                    continue;
                 }
+
+                let path = entry.path();
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if !autoload_exts.contains(ext) {
+                    continue;
+                }
+
+                filenames.push(path.to_string_lossy().into_owned());
             }
         }
 

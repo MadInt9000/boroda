@@ -126,7 +126,7 @@ async fn main() -> io::Result<()> {
                 }
 
                 // Ветка 3: Ответы от серверов (обрабатываются в rx_worker)
-                lsp_msg_option = global_rx.recv(), if !intermediate.is_modal_active() => {
+                lsp_msg_option = global_rx.recv() => {
                     if let Some(lsp_msg) = lsp_msg_option {
                         new_file = RxWorker::handle_message(
                             &lsp_msg,
@@ -135,6 +135,7 @@ async fn main() -> io::Result<()> {
                             &mut current_editor_idx,
                             &lsp_pool,
                             &mut stdout,
+                            !intermediate.is_modal_active()
                         )?;
                     }
                 }

@@ -17,6 +17,8 @@ pub struct BaseEditor {
     pub screen_rows: u16,
     pub has_indent: bool,
     pub should_quit: bool,
+    /// Были ли изменения с момента последней загрузки/сохранения.
+    pub modified: bool,
     pub selection: Option<Selection>,
     pub error_count: usize,
     pub warning_count: usize,
@@ -40,6 +42,7 @@ impl BaseEditor {
             screen_rows: 0,
             has_indent: true,
             should_quit: false,
+            modified: false,
             selection: None,
             error_count: 0,
             warning_count: 0,
@@ -68,12 +71,14 @@ impl BaseEditor {
     pub fn undo(&mut self) {
         if self.history.undo(&mut self.lines, &mut self.cursor_y) {
             self.sync_after_history();
+            self.modified = true;
         }
     }
 
     pub fn redo(&mut self) {
         if self.history.redo(&mut self.lines, &mut self.cursor_y) {
             self.sync_after_history();
+            self.modified = true;
         }
     }
 
@@ -103,6 +108,11 @@ impl BaseEditor {
         self.row_offset = 0;
         self.col_offset = 0;
         self.diagnostics.clear();
+        self.modified = false;
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.modified = false;
     }
 
     pub fn update_window_size(&mut self) -> io::Result<()> {
@@ -263,10 +273,97 @@ impl BaseEditor {
         }
     }
 
+    /// Если курсор стоит на скобке, возвращает её позицию и позицию парной скобки.
+    fn matching_brackets(&self) -> Option<((usize, usize), (usize, usize))> {
+        let line = self.lines.get(self.cursor_y)?;
+        let bracket = *line.get(self.cursor_x)?;
+
+        let (open, close) = match bracket {
+            '(' => ('(', ')'),
+            ')' => ('(', ')'),
+            '[' => ('[', ']'),
+            ']' => ('[', ']'),
+            '{' => ('{', '}'),
+            '}' => ('{', '}'),
+            _ => return None,
+        };
+
+        let matched = if bracket == open {
+            self.find_bracket_forward(self.cursor_y, self.cursor_x, open, close)?
+        } else {
+            self.find_bracket_backward(self.cursor_y, self.cursor_x, open, close)?
+        };
+
+        Some(((self.cursor_y, self.cursor_x), matched))
+    }
+
+    fn find_bracket_forward(
+        &self,
+        start_y: usize,
+        start_x: usize,
+        open: char,
+        close: char,
+    ) -> Option<(usize, usize)> {
+        let mut depth = 0usize;
+
+        for y in start_y..self.lines.len() {
+            let line = &self.lines[y];
+            let start = if y == start_y { start_x } else { 0 };
+
+            for (x, &c) in line.iter().enumerate().skip(start) {
+                if c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((y, x));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn find_bracket_backward(
+        &self,
+        start_y: usize,
+        start_x: usize,
+        open: char,
+        close: char,
+    ) -> Option<(usize, usize)> {
+        let mut depth = 0usize;
+        let mut y = start_y;
+        let mut x = start_x + 1;
+
+        loop {
+            while x > 0 {
+                x -= 1;
+                let c = self.lines[y][x];
+
+                if c == close {
+                    depth += 1;
+                } else if c == open {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((y, x));
+                    }
+                }
+            }
+
+            if y == 0 {
+                return None;
+            }
+            y -= 1;
+            x = self.lines[y].len();
+        }
+    }
+
     fn draw_line_with_lsp_syntax(
         &self,
         file_row: usize,
         render_len: usize,
+        matching_brackets: Option<((usize, usize), (usize, usize))>,
         stdout: &mut io::Stdout,
     ) -> io::Result<()> {
         let line = &self.lines[file_row];
@@ -283,6 +380,11 @@ impl BaseEditor {
 
             let is_err = self.is_error_char(file_row, file_col);
             let is_sel = self.is_inside_selection(file_row, file_col);
+            let is_bracket = matches!(
+                matching_brackets,
+                Some((first, second))
+                    if first == (file_row, file_col) || second == (file_row, file_col)
+            );
 
             if is_sel {
                 output.push_str("\x1b[7m");
@@ -291,7 +393,11 @@ impl BaseEditor {
                 continue;
             }
 
-            if is_err {
+            if is_bracket {
+                output.push_str("\x1b[1;30;46m");
+                output.push(c);
+                output.push_str("\x1b[0m");
+            } else if is_err {
                 output.push_str("\x1b[41m");
                 output.push(c);
                 output.push_str("\x1b[0m");
@@ -348,6 +454,7 @@ impl BaseEditor {
         stdout.queue(Print(format!("\x1b[7m{}\x1b[m", render_status)))?;
 
         // 2. Отображение текста с подсветкой синтаксиса
+        let matching_brackets = self.matching_brackets();
         let text_rows = self.screen_rows.saturating_sub(2) as usize;
         for i in 0..text_rows {
             let file_row = i + self.row_offset;
@@ -357,12 +464,16 @@ impl BaseEditor {
                 let line = &self.lines[file_row];
                 if line.len() > self.col_offset {
                     let render_len = (line.len() - self.col_offset).min(self.screen_cols as usize);
-                    self.draw_line_with_lsp_syntax(file_row, render_len, stdout)?;
+                    self.draw_line_with_lsp_syntax(
+                        file_row,
+                        render_len,
+                        matching_brackets,
+                        stdout,
+                    )?;
                 }
-                stdout.queue(Print("\x1b[K"))?;
-            } else {
-                stdout.queue(Print("\x1b[K"))?;
             }
+
+            stdout.queue(Print("\x1b[K"))?;
         }
 
         // 3. Подсказки
@@ -388,7 +499,7 @@ impl BaseEditor {
                 "F6 Paste",
                 "F7 Clear",
                 "F8 Cut",
-                "F9 Begin",
+                "F9 OpnFls",
                 "F10 Quit",
                 "F11 ExSave",
                 "F12 Reload",
@@ -448,15 +559,19 @@ impl BaseEditor {
     }
 
     pub fn clear_current_line(&mut self) {
-        if !self.lines.is_empty() {
-            if !self.lines[self.cursor_y].is_empty() {
-                let old = self.line_string(self.cursor_y);
-                self.history.record(Operation::Change, self.cursor_y, old);
-            }
-            self.lines[self.cursor_y].clear();
-            self.semantic_tokens[self.cursor_y].clear();
-            self.cursor_x = 0;
+        if self.lines.is_empty() {
+            return;
         }
+        if self.lines[self.cursor_y].is_empty() {
+            return;
+        }
+
+        let old = self.line_string(self.cursor_y);
+        self.history.record(Operation::Change, self.cursor_y, old);
+        self.lines[self.cursor_y].clear();
+        self.semantic_tokens[self.cursor_y].clear();
+        self.cursor_x = 0;
+        self.modified = true;
     }
 
     pub fn move_to_line_start(&mut self) {
@@ -516,6 +631,7 @@ impl BaseEditor {
         self.history.record(Operation::Change, self.cursor_y, old);
         self.lines[self.cursor_y].insert(self.cursor_x, c);
         self.cursor_x += 1;
+        self.modified = true;
     }
 
     pub fn delete_char_at_cursor(&mut self) {
@@ -523,6 +639,7 @@ impl BaseEditor {
             let old = self.line_string(self.cursor_y);
             self.history.record(Operation::Change, self.cursor_y, old);
             self.lines[self.cursor_y].remove(self.cursor_x);
+            self.modified = true;
         }
     }
 
@@ -532,6 +649,7 @@ impl BaseEditor {
             self.history.record(Operation::Change, self.cursor_y, old);
             self.lines[self.cursor_y].remove(self.cursor_x - 1);
             self.cursor_x -= 1;
+            self.modified = true;
         } else if self.cursor_y > 0 {
             let prev_old = self.line_string(self.cursor_y - 1);
             let current_old = self.line_string(self.cursor_y);
@@ -545,6 +663,7 @@ impl BaseEditor {
             self.cursor_y -= 1;
             self.cursor_x = self.lines[self.cursor_y].len();
             self.lines[self.cursor_y].extend(current_line);
+            self.modified = true;
         }
     }
 
@@ -586,6 +705,7 @@ impl BaseEditor {
         // 5. Переводим курсор на новую строку, смещая его на длину автоотступа
         self.cursor_y += 1;
         self.cursor_x = indent_len;
+        self.modified = true;
     }
 
     pub fn toggle_indent(&mut self) {
@@ -602,6 +722,7 @@ impl BaseEditor {
             self.lines[self.cursor_y].insert(self.cursor_x, c);
             self.cursor_x += 1;
         }
+        self.modified = true;
     }
 
     pub fn move_word_left(&mut self) {
@@ -741,6 +862,7 @@ impl BaseEditor {
     /// Удаляет выделенный текст, если он есть
     pub fn delete_selection(&mut self) {
         let (start_y, start_x, end_y, end_x) = self.get_block();
+        let had_content = start_y != end_y || start_x < end_x;
 
         if start_y == end_y {
             if start_y < self.lines.len() {
@@ -757,7 +879,7 @@ impl BaseEditor {
                 remaining_suffix = self.lines[end_y][end_x..].to_vec();
             }
 
-            // Сначала изменение стартовой строки, затем удаление строк ниже.
+            // Сначала удаление строк ниже, затем изменение стартовой строки.
             // Удалённые строки пишем в обратном порядке (снизу вверх), чтобы
             // undo восстанавливал их сверху вниз с правильными индексами.
             let old_start = self.line_string(start_y);
@@ -784,6 +906,9 @@ impl BaseEditor {
         self.cursor_y = start_y;
         self.cursor_x = start_x;
         self.selection = None;
+        if had_content {
+            self.modified = true;
+        }
     }
 
     /// Копирование выделенного фрагмента (или текущей строки) в ClipboardManager
@@ -859,6 +984,8 @@ impl BaseEditor {
                     .record(Operation::Insert, start_y + 1 + offset, line);
             }
         }
+
+        self.modified = true;
     }
 
     pub fn begin_selection(&mut self) {
@@ -907,8 +1034,12 @@ impl BaseEditor {
 }
 
 impl TextInteractive for BaseEditor {
-    fn title(&self) -> &str {
-        &self.filename
+    fn title(&self) -> String {
+        if self.modified {
+            format!("{}*", self.filename)
+        } else {
+            self.filename.clone()
+        }
     }
 
     fn lines(&self) -> &Vec<Vec<char>> {
@@ -921,6 +1052,10 @@ impl TextInteractive for BaseEditor {
 
     fn load_lines(&mut self, lines: Vec<Vec<char>>) {
         self.load_lines(lines)
+    }
+
+    fn mark_saved(&mut self) {
+        self.mark_saved()
     }
 
     fn update_window_size(&mut self) -> io::Result<()> {
@@ -1156,6 +1291,38 @@ mod tests {
 
         editor.jump_to_diagnostic(99);
         assert_eq!((editor.cursor_y, editor.cursor_x), (1, 0));
+    }
+
+    #[test]
+    fn matching_brackets_finds_pairs_across_lines() {
+        let mut editor = editor_with(&["fn main() {", "    let x = [1, 2];", "}"]);
+
+        editor.set_cursor(0, 10);
+        assert_eq!(editor.matching_brackets(), Some(((0, 10), (2, 0))));
+
+        editor.set_cursor(1, 12);
+        assert_eq!(editor.matching_brackets(), Some(((1, 12), (1, 17))));
+
+        editor.set_cursor(2, 0);
+        assert_eq!(editor.matching_brackets(), Some(((2, 0), (0, 10))));
+
+        editor.set_cursor(0, 0);
+        assert_eq!(editor.matching_brackets(), None);
+    }
+
+    #[test]
+    fn title_marks_modified_file_with_asterisk() {
+        let mut editor = editor_with(&["hello"]);
+        assert_eq!(editor.title(), "test");
+
+        editor.insert_char('x');
+        assert_eq!(editor.title(), "test*");
+
+        editor.mark_saved();
+        assert_eq!(editor.title(), "test");
+
+        editor.undo();
+        assert_eq!(editor.title(), "test*");
     }
 
     #[test]

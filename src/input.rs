@@ -167,8 +167,7 @@ impl InputDriver {
                     KeyCode::F(6) => text_editor.paste_from_clipboard(),
                     KeyCode::F(7) => text_editor.clear_current_line(),
                     KeyCode::F(8) => text_editor.cut_to_clipboard(),
-                    KeyCode::F(9) => text_editor.move_to_line_start(),
-
+                    //пока на F9 список открытых файлов KeyCode::F(9) => text_editor.move_to_line_start(),
                     KeyCode::PageUp => text_editor.page_up(),
                     KeyCode::PageDown => text_editor.page_down(),
                     KeyCode::Home => text_editor.move_to_line_start(),
@@ -222,7 +221,9 @@ impl InputDriver {
                 match mouse_event.kind {
                     MouseEventKind::Drag(MouseButton::Left) => {
                         text_editor.click_mouse(mouse_event.column, mouse_event.row);
-                        if !text_editor.has_selection() { text_editor.begin_selection(); }
+                        if !text_editor.has_selection() {
+                            text_editor.begin_selection();
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         text_editor.clear_selection();
@@ -260,13 +261,14 @@ impl InputDriver {
     }
 
     fn save(
-        text_editor: &dyn TextInteractive,
+        text_editor: &mut dyn TextInteractive,
         file_editor: &dyn FileOperations,
         lsp_pool: &[LspClient],
     ) -> io::Result<()> {
         let lines = text_editor.lines();
         file_editor.save_file(lines)?;
         file_editor.notify_saved(lsp_pool);
+        text_editor.mark_saved();
         Ok(())
     }
 }

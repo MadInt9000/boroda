@@ -72,7 +72,7 @@ impl Editor {
 }
 
 impl TextInteractive for Editor {
-    fn title(&self) -> &str {
+    fn title(&self) -> String {
         self.base.title()
     }
 
@@ -86,6 +86,10 @@ impl TextInteractive for Editor {
 
     fn load_lines(&mut self, lines: Vec<Vec<char>>) {
         self.base.load_lines(lines)
+    }
+
+    fn mark_saved(&mut self) {
+        self.base.mark_saved()
     }
 
     fn update_window_size(&mut self) -> io::Result<()> {
